@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境 & 解释器
+venv/
+env/
+.venv/
+python.exe
+Lib/
+Scripts/
+Include/
+
+# 数据 & 模型（放 LFS）
+*.h5
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.zip
+*.tar.gz
+*.7z
+*.mp4
