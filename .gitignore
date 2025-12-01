@@ -16,3 +16,6 @@ venv/
 .idea/
 .qtcreator/
 EOF
+
+# 模型
+*.pth
