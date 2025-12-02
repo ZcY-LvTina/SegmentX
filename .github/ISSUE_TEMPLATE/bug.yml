@@ -1,0 +1,83 @@
+name: "🐛 Bug 报告"
+description: "程序行为不符合预期、报错或崩溃"
+title: "[Bug] 简要描述问题"
+labels: ["type: bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你提交 Bug！请尽量按照下面的项目填写，这样以后排查会非常轻松。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 简要说明出现了什么问题。
+      placeholder: 比如：打开一张 4K 图片后，界面无响应，几秒后程序崩溃。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请尽量写出可以一步步复现问题的操作流程。
+      placeholder: |
+        1. 打开 SegmentX
+        2. 点击「打开图片」
+        3. 选择 xxx.png
+        4. 点击「开始分割」
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 你本来期望程序怎样表现？
+      placeholder: 比如：应正常显示分割结果，而不是崩溃。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为（包括报错信息）
+      description: 实际发生了什么？有报错的话尽量贴完整报错（可以用代码块）。
+      placeholder: |
+        实际情况：
+        - 界面卡死 3 秒
+        - 弹出报错框 / 命令行输出 traceback
+
+        报错示例（可选）：
+        ```text
+        Traceback (most recent call last):
+          ...
+        ```
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 项目版本 / 提交哈希
+      description: 可以用 `git rev-parse HEAD` 获取当前 commit。
+      placeholder: 例如：e4f3a21
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      placeholder: 例如：3.11.7
