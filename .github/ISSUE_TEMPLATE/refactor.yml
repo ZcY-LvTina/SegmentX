@@ -1,0 +1,49 @@
+name: "🧹 重构 / 结构调整"
+description: "不改变外部行为的前提下，整理代码结构、优化实现"
+title: "[Refactor] 简要描述重构内容"
+labels: ["type: refactor"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        用这个模板来记录项目结构调整、代码重构、依赖升级等「不直接增加新功能」的改动。
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 改动范围
+      description: 将会影响哪些模块 / 文件？
+      placeholder: 比如：拆分 main.py，将界面逻辑移到 src/segmentx/ui 目录下。
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: 动机
+      description: 为什么要做这次重构？解决什么痛点？
+      placeholder: 比如：main.py 过于臃肿，不利于后续扩展和测试。
+    validations:
+      required: true
+
+  - type: textarea
+    id: plan
+    attributes:
+      label: 计划 / 步骤
+      description: 可以简单列一下预期的重构步骤。
+      placeholder: |
+        1. 新建 src/segmentx/ui 目录
+        2. 把窗口类移过去
+        3. main.py 只保留入口
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: risk
+    attributes:
+      label: 影响评估
+      description: 勾选适用的项。
+      options:
+        - label: 可能影响现有功能的行为
+        - label: 可能需要更新文档
+        - label: 可能需要更新测试

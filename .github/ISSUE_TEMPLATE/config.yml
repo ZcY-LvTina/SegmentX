@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 一般讨论 / 想法收集
+    url: https://github.com/ZcY-LvTina/SegmentX/discussions
+    about: 不属于 Bug / 功能需求 / 重构的内容，可以发到 Discussions。

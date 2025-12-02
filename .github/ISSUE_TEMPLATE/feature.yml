@@ -1,0 +1,51 @@
+name: "✨ 功能需求 / 改进建议"
+description: "想要新增的功能，或对现有功能的改进"
+title: "[Feature] 简要描述功能"
+labels: ["type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        用这个模板来描述你希望 SegmentX 增加或改进的功能。
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景 & 动机
+      description: 这个需求是为了解决什么问题？为什么需要它？
+      placeholder: 比如：目前只能手动保存结果，批量标注时很麻烦，希望支持一键导出全部标注。
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 功能描述（从用户角度）
+      description: 用户将如何使用这个功能？界面/命令行会发生什么变化？
+      placeholder: |
+        - 在主界面增加一个「导出全部」按钮
+        - 点击后弹出对话框选择导出目录
+        - 导出每张图片的分割结果为 JSON + PNG
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准（完成的判断条件）
+      description: 写清楚达到什么效果可以认为“已经完成”。
+      placeholder: |
+        - 对于任意当前项目，点击按钮后能够成功导出
+        - 导出路径可配置
+        - 导出的 JSON 中包含 xxx 字段
+    validations:
+      required: true
+
+  - type: textarea
+    id: ideas
+    attributes:
+      label: 可能的实现思路（可选）
+      description: 如果你已经有一些实现想法，可以写在这里；没有就留空。
+      placeholder: |
+        - 复用现有保存单张图片结果的逻辑
+        - 在 src/segmentx/exporter.py 新建导出模块
