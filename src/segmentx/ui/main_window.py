@@ -139,6 +139,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            self.engine.clear_cache()
             self.sessions = []
             self.current_index = -1
             for path in file_paths:
@@ -156,7 +157,7 @@ class MainWindow(QMainWindow):
             if self.sessions:
                 self.current_index = 0
                 self._show_current_image()
-                self._set_engine_image(self.current_session.state.original_image)  # type: ignore[union-attr]
+                self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
                 self._update_navigation_buttons()
                 self.save_button.setEnabled(True)
                 self.save_all_button.setEnabled(True)
@@ -166,11 +167,17 @@ class MainWindow(QMainWindow):
             show_error(self, "错误", f"加载图像失败: {exc}")
             self.status_label.setText("状态: 图像加载失败")
 
-    def _set_engine_image(self, image) -> None:
+    def _set_engine_image(self, image, image_id: str) -> bool:
+        # 为多图切换复用缓存的SAM embedding，减少重复编码开销
         try:
-            self.engine.set_image(image_to_array(image))
+            self.status_label.setText("状态: 正在准备图像特征")
+            from_cache = self.engine.set_image(image_to_array(image), image_id=image_id)
+            status = "状态: 使用缓存的图像特征" if from_cache else "状态: 已准备图像特征"
+            self.status_label.setText(status)
+            return from_cache
         except Exception as exc:
             show_error(self, "错误", f"设置图像到SAM模型失败: {exc}")
+            return False
 
     def _show_current_image(self) -> None:
         session = self.current_session
@@ -185,19 +192,25 @@ class MainWindow(QMainWindow):
         if self.current_index > 0:
             self.current_index -= 1
             self._show_current_image()
-            self._set_engine_image(self.current_session.state.original_image)  # type: ignore[union-attr]
+            from_cache = self._set_engine_image(
+                self.current_session.state.original_image, self.current_session.state.path
+            )  # type: ignore[union-attr]
             self._update_navigation_buttons()
             self._update_image_info()
-            self.status_label.setText("状态: 切换到上一张图片")
+            status = "状态: 切换到上一张图片 (缓存特征)" if from_cache else "状态: 切换到上一张图片"
+            self.status_label.setText(status)
 
     def next_image(self) -> None:
         if self.current_index < len(self.sessions) - 1:
             self.current_index += 1
             self._show_current_image()
-            self._set_engine_image(self.current_session.state.original_image)  # type: ignore[union-attr]
+            from_cache = self._set_engine_image(
+                self.current_session.state.original_image, self.current_session.state.path
+            )  # type: ignore[union-attr]
             self._update_navigation_buttons()
             self._update_image_info()
-            self.status_label.setText("状态: 切换到下一张图片")
+            status = "状态: 切换到下一张图片 (缓存特征)" if from_cache else "状态: 切换到下一张图片"
+            self.status_label.setText(status)
 
     def _update_navigation_buttons(self) -> None:
         self.prev_button.setEnabled(self.current_index > 0)
