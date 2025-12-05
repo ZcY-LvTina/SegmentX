@@ -12,6 +12,8 @@ def run_segmentation(session: Session, engine: SamEngine) -> np.ndarray | None:
     labels = np.array(session.state.labels)
     mask = engine.segment(points, labels)
     session.state.mask = mask
+    # Keep interactive hint layer aligned with latest result; can be hidden via UI toggle
+    session.state.mask_layers.hint = mask
     return mask
 
 

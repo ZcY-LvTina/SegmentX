@@ -8,13 +8,13 @@ from ..core.session import ImageState
 from ..utils.paths import ensure_dir
 
 
-def _compose_masked_image(image: Image.Image, mask: np.ndarray) -> Image.Image:
-    """Compose original image with semi-transparent green mask."""
+def _compose_masked_image(image: Image.Image, mask: np.ndarray) -> tuple[Image.Image, Image.Image]:
+    """Compose result using mask as alpha without drawing hint overlays."""
     base = image.convert("RGBA")
     mask_image = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
-    color_mask = Image.new("RGBA", base.size, (0, 255, 0, 128))
-    masked_overlay = Image.composite(color_mask, Image.new("RGBA", base.size, (0, 0, 0, 0)), mask_image)
-    return Image.alpha_composite(base, masked_overlay)
+    result = base.copy()
+    result.putalpha(mask_image)
+    return result, mask_image
 
 
 def save_masked_result(
@@ -29,8 +29,8 @@ def save_masked_result(
     output_path = Path(output_path)
     ensure_dir(output_path.parent)
 
-    # Build image with overlay; drop alpha for JPEG/BMP.
-    result = _compose_masked_image(image_state.original_image, image_state.mask)
+    # Build image with segmentation as alpha; drop hint layer on save.
+    result, mask_image = _compose_masked_image(image_state.original_image, image_state.mask)
 
     suffix = output_path.suffix.lower()
     if not suffix and file_format:
@@ -39,7 +39,10 @@ def save_masked_result(
 
     format_to_use = file_format or (suffix[1:].upper() if suffix else "PNG")
     if format_to_use.upper() in ["JPEG", "JPG", "BMP"]:
-        result = result.convert("RGB")
+        # Flatten alpha onto white background for formats without transparency.
+        flattened = Image.new("RGB", result.size, (255, 255, 255))
+        flattened.paste(result, mask=mask_image)
+        result = flattened
 
     result.save(output_path, format=format_to_use)
     return output_path

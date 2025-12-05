@@ -1,8 +1,24 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
 from PIL import Image
+
+
+@dataclass
+class MaskLayers:
+    """Mask layers to separate final result and auxiliary tool overlays."""
+
+    result: Optional[np.ndarray] = None  # final segmentation mask
+    hint: Optional[np.ndarray] = None  # tool/hint layer (e.g., green overlay)
+    show_hint: bool = True
+
+    def clone(self) -> "MaskLayers":
+        return MaskLayers(
+            result=self.result.copy() if self.result is not None else None,
+            hint=self.hint.copy() if self.hint is not None else None,
+            show_hint=self.show_hint,
+        )
 
 
 @dataclass
@@ -12,7 +28,16 @@ class ImageState:
     display_image: Image.Image
     click_points: List[List[int]]
     labels: List[int]
-    mask: Optional[np.ndarray] = None
+    mask_layers: MaskLayers = field(default_factory=MaskLayers)
+
+    @property
+    def mask(self) -> Optional[np.ndarray]:
+        # Backward compatibility for existing callers
+        return self.mask_layers.result
+
+    @mask.setter
+    def mask(self, value: Optional[np.ndarray]) -> None:
+        self.mask_layers.result = value
 
     def clone(self) -> "ImageState":
         return ImageState(
@@ -21,7 +46,7 @@ class ImageState:
             display_image=self.display_image.copy(),
             click_points=[pt.copy() for pt in self.click_points],
             labels=self.labels.copy(),
-            mask=self.mask.copy() if self.mask is not None else None,
+            mask_layers=self.mask_layers.clone(),
         )
 
 

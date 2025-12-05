@@ -30,21 +30,32 @@ class ImageViewer(ClickableLabel):
         display_image: Image.Image = self._state.display_image.copy()
         overlay = Image.new("RGBA", display_image.size, (0, 0, 0, 0))
 
-        # Apply mask overlay
-        if self._state.mask is not None:
-            mask_image = Image.fromarray((self._state.mask * 255).astype("uint8"), mode="L")
-            color_mask = Image.new("RGBA", display_image.size, (0, 255, 0, 128))
+        # Layered overlay: show hint layer when enabled, otherwise fall back to result mask
+        mask_to_draw = None
+        if self._state.mask_layers.show_hint:
+            if self._state.mask_layers.hint is not None:
+                mask_to_draw = ("hint", self._state.mask_layers.hint)
+            elif self._state.mask_layers.result is not None:
+                mask_to_draw = ("result", self._state.mask_layers.result)
+
+        if mask_to_draw is not None:
+            layer_type, mask_data = mask_to_draw
+            mask_image = Image.fromarray((mask_data * 255).astype("uint8"), mode="L")
+            opacity = 100 if layer_type == "hint" else 140
+            color_mask = Image.new("RGBA", display_image.size, (0, 255, 0, opacity))
             overlay.paste(color_mask, (0, 0), mask_image)
 
         # Draw click points
-        for point, label in zip(self._state.click_points, self._state.labels):
-            x, y = point
-            color = (255, 0, 0, 255) if label == 1 else (0, 0, 255, 255)
-            size = 10
-            marker = Image.new("RGBA", (size * 2, size * 2), (0, 0, 0, 0))
-            marker_draw = ImageDraw.Draw(marker)
-            marker_draw.ellipse([(0, 0), (size * 2 - 1, size * 2 - 1)], fill=color)
-            overlay.paste(marker, (x - size, y - size), marker)
+        # Click markers属于提示层，隐藏提示掩膜时一并隐藏
+        if self._state.mask_layers.show_hint:
+            for point, label in zip(self._state.click_points, self._state.labels):
+                x, y = point
+                color = (255, 0, 0, 255) if label == 1 else (0, 0, 255, 255)
+                size = 10
+                marker = Image.new("RGBA", (size * 2, size * 2), (0, 0, 0, 0))
+                marker_draw = ImageDraw.Draw(marker)
+                marker_draw.ellipse([(0, 0), (size * 2 - 1, size * 2 - 1)], fill=color)
+                overlay.paste(marker, (x - size, y - size), marker)
 
         composed = Image.alpha_composite(display_image.convert("RGBA"), overlay).convert("RGB")
         pixmap = qt_convert.pil_to_qpixmap(composed)

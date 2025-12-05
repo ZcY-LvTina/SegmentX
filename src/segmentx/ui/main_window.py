@@ -68,6 +68,10 @@ class MainWindow(QMainWindow):
         self.save_all_button = QPushButton("保存所有结果")
         self.undo_button = QPushButton("撤销 (Ctrl+Z)")
         self.redo_button = QPushButton("重做 (Ctrl+Y)")
+        self.toggle_hint_button = QPushButton("隐藏提示掩膜")
+        self.toggle_hint_button.setCheckable(True)
+        self.toggle_hint_button.setChecked(True)
+        self.toggle_hint_button.setEnabled(False)
         self.foreground_button = QPushButton("前景标记")
         self.background_button = QPushButton("背景标记")
         self.status_label = QLabel("状态: 等待加载图像")
@@ -82,6 +86,7 @@ class MainWindow(QMainWindow):
         self.save_all_button.clicked.connect(self.save_all_results)
         self.undo_button.clicked.connect(self.undo_action)
         self.redo_button.clicked.connect(self.redo_action)
+        self.toggle_hint_button.clicked.connect(self.toggle_hint_mask)
         self.foreground_button.clicked.connect(self.set_foreground_mode)
         self.background_button.clicked.connect(self.set_background_mode)
 
@@ -108,6 +113,7 @@ class MainWindow(QMainWindow):
             self.redo_button,
             self.foreground_button,
             self.background_button,
+            self.toggle_hint_button,
             self.image_info_label,
             self.status_label,
         ]:
@@ -150,7 +156,6 @@ class MainWindow(QMainWindow):
                     display_image=img.copy(),
                     click_points=[],
                     labels=[],
-                    mask=None,
                 )
                 self.sessions.append(Session(state, max_history=MAX_HISTORY))
 
@@ -187,6 +192,7 @@ class MainWindow(QMainWindow):
         session.redo_stack.clear()
         self.image_viewer.set_state(session.state)
         self._update_history_buttons()
+        self._sync_hint_button(session.state.mask_layers.show_hint)
 
     def prev_image(self) -> None:
         if self.current_index > 0:
@@ -312,6 +318,15 @@ class MainWindow(QMainWindow):
         self.background_button.setChecked(True)
         self.status_label.setText("状态: 当前模式 - 背景标记")
 
+    def toggle_hint_mask(self) -> None:
+        session = self.current_session
+        if not session:
+            return
+        session.state.mask_layers.show_hint = not session.state.mask_layers.show_hint
+        self._sync_hint_button(session.state.mask_layers.show_hint)
+        # Render without mutating underlying image; hint layer remains data-only
+        self.image_viewer.set_state(session.state)
+
     def on_image_clicked(self, pos: QPoint) -> None:
         session = self.current_session
         if not session:
@@ -355,6 +370,7 @@ class MainWindow(QMainWindow):
         session.state.click_points = []
         session.state.labels = []
         session.state.mask = None
+        session.state.mask_layers.hint = None
         session.state.display_image = session.state.original_image.copy()
 
         self.image_viewer.set_state(session.state)
@@ -386,9 +402,17 @@ class MainWindow(QMainWindow):
         if not session:
             self.undo_button.setEnabled(False)
             self.redo_button.setEnabled(False)
+            self._sync_hint_button(False)
             return
         self.undo_button.setEnabled(session.can_undo())
         self.redo_button.setEnabled(session.can_redo())
+
+    def _sync_hint_button(self, show: bool) -> None:
+        self.toggle_hint_button.blockSignals(True)
+        self.toggle_hint_button.setChecked(show)
+        self.toggle_hint_button.setText("隐藏提示掩膜" if show else "显示提示掩膜")
+        self.toggle_hint_button.setEnabled(bool(self.sessions))
+        self.toggle_hint_button.blockSignals(False)
 
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
