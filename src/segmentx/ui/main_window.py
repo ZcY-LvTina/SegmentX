@@ -2,15 +2,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtWidgets import (
-    QLabel,
-    QHBoxLayout,
-    QMainWindow,
-    QPushButton,
-    QScrollArea,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QLabel, QHBoxLayout, QMainWindow, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..config import MAX_HISTORY
 from ..core.export import bulk_export, save_masked_result
@@ -27,7 +19,7 @@ from .dialogs import (
     show_info,
     show_warning,
 )
-from .image_viewer import ImageViewer
+from .image_viewer import AspectRatioContainer, ImageViewer
 from .shortcuts import setup_shortcuts
 
 
@@ -59,6 +51,11 @@ class MainWindow(QMainWindow):
         control_layout = QVBoxLayout(control_panel)
         control_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
+        # Image viewer created early so control buttons can bind zoom/reset handlers
+        self.image_viewer = ImageViewer()
+        self.image_viewer.setMinimumSize(800, 600)
+        self.image_viewer.clicked.connect(self.on_image_clicked)
+
         # 合并单图/多图入口后的统一加载按钮
         self.load_button = QPushButton("加载图片")
         self.prev_button = QPushButton("上一张 (←)")
@@ -72,6 +69,9 @@ class MainWindow(QMainWindow):
         self.toggle_hint_button.setCheckable(True)
         self.toggle_hint_button.setChecked(True)
         self.toggle_hint_button.setEnabled(False)
+        self.zoom_in_button = QPushButton("放大 (+)")
+        self.zoom_out_button = QPushButton("缩小 (-)")
+        self.reset_zoom_button = QPushButton("适配窗口")
         self.foreground_button = QPushButton("前景标记")
         self.background_button = QPushButton("背景标记")
         self.status_label = QLabel("状态: 等待加载图像")
@@ -87,6 +87,9 @@ class MainWindow(QMainWindow):
         self.undo_button.clicked.connect(self.undo_action)
         self.redo_button.clicked.connect(self.redo_action)
         self.toggle_hint_button.clicked.connect(self.toggle_hint_mask)
+        self.zoom_in_button.clicked.connect(lambda: self.image_viewer.zoom(1.2))
+        self.zoom_out_button.clicked.connect(lambda: self.image_viewer.zoom(1 / 1.2))
+        self.reset_zoom_button.clicked.connect(self.image_viewer.reset_view)
         self.foreground_button.clicked.connect(self.set_foreground_mode)
         self.background_button.clicked.connect(self.set_background_mode)
 
@@ -114,6 +117,9 @@ class MainWindow(QMainWindow):
             self.foreground_button,
             self.background_button,
             self.toggle_hint_button,
+            self.zoom_in_button,
+            self.zoom_out_button,
+            self.reset_zoom_button,
             self.image_info_label,
             self.status_label,
         ]:
@@ -123,14 +129,14 @@ class MainWindow(QMainWindow):
         # Image area
         image_panel = QWidget()
         image_layout = QVBoxLayout(image_panel)
-        self.image_viewer = ImageViewer()
-        self.image_viewer.setMinimumSize(800, 600)
-        self.image_viewer.clicked.connect(self.on_image_clicked)
-
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(self.image_viewer)
-        image_layout.addWidget(scroll_area)
+        ratio_container = AspectRatioContainer(ratio=4 / 3)
+        ratio_container.set_child(self.image_viewer)
+        ratio_container.setMinimumSize(800, 600)
+        ratio_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        image_layout.addWidget(ratio_container)
         main_layout.addWidget(image_panel, stretch=4)
 
     @property
@@ -161,7 +167,7 @@ class MainWindow(QMainWindow):
 
             if self.sessions:
                 self.current_index = 0
-                self._show_current_image()
+                self._show_current_image(reset_view=True)
                 self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
                 self._update_navigation_buttons()
                 self.save_button.setEnabled(True)
@@ -184,20 +190,20 @@ class MainWindow(QMainWindow):
             show_error(self, "错误", f"设置图像到SAM模型失败: {exc}")
             return False
 
-    def _show_current_image(self) -> None:
+    def _show_current_image(self, reset_view: bool = False) -> None:
         session = self.current_session
         if not session:
             return
         session.undo_stack.clear()
         session.redo_stack.clear()
-        self.image_viewer.set_state(session.state)
+        self.image_viewer.set_state(session.state, reset_view=reset_view)
         self._update_history_buttons()
         self._sync_hint_button(session.state.mask_layers.show_hint)
 
     def prev_image(self) -> None:
         if self.current_index > 0:
             self.current_index -= 1
-            self._show_current_image()
+            self._show_current_image(reset_view=False)
             from_cache = self._set_engine_image(
                 self.current_session.state.original_image, self.current_session.state.path
             )  # type: ignore[union-attr]
@@ -209,7 +215,7 @@ class MainWindow(QMainWindow):
     def next_image(self) -> None:
         if self.current_index < len(self.sessions) - 1:
             self.current_index += 1
-            self._show_current_image()
+            self._show_current_image(reset_view=False)
             from_cache = self._set_engine_image(
                 self.current_session.state.original_image, self.current_session.state.path
             )  # type: ignore[union-attr]
