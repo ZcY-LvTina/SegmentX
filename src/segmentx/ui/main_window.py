@@ -59,8 +59,8 @@ class MainWindow(QMainWindow):
         control_layout = QVBoxLayout(control_panel)
         control_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self.load_button = QPushButton("加载图像")
-        self.load_multiple_button = QPushButton("加载多个图像")
+        # 合并单图/多图入口后的统一加载按钮
+        self.load_button = QPushButton("加载图片")
         self.prev_button = QPushButton("上一张 (←)")
         self.next_button = QPushButton("下一张 (→)")
         self.clear_button = QPushButton("清除标记")
@@ -74,8 +74,7 @@ class MainWindow(QMainWindow):
         self.image_info_label = QLabel("当前图片: 0/0")
 
         # Button wiring
-        self.load_button.clicked.connect(lambda: self.load_images(single=True))
-        self.load_multiple_button.clicked.connect(lambda: self.load_images(single=False))
+        self.load_button.clicked.connect(self.load_images)
         self.prev_button.clicked.connect(self.prev_image)
         self.next_button.clicked.connect(self.next_image)
         self.clear_button.clicked.connect(self.clear_markers)
@@ -100,7 +99,6 @@ class MainWindow(QMainWindow):
         # Add to layout
         for widget in [
             self.load_button,
-            self.load_multiple_button,
             self.prev_button,
             self.next_button,
             self.clear_button,
@@ -135,8 +133,8 @@ class MainWindow(QMainWindow):
             return self.sessions[self.current_index]
         return None
 
-    def load_images(self, single: bool = True) -> None:
-        file_paths = choose_images(self, single)
+    def load_images(self) -> None:
+        file_paths = choose_images(self)
         if not file_paths:
             return
 
