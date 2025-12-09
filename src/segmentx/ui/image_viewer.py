@@ -87,13 +87,17 @@ class ImageViewer(ClickableLabel):
         display_image: Image.Image = self._state.display_image.copy()
         overlay = Image.new("RGBA", display_image.size, (0, 0, 0, 0))
 
-        # Layered overlay: show hint layer when enabled, otherwise fall back to result mask
+        # Layered overlay: manual_mask 优先，其次 hint/result/auto，受 show_hint 控制
         mask_to_draw = None
         if self._state.mask_layers.show_hint:
-            if self._state.mask_layers.hint is not None:
+            if self._state.manual_mask is not None:
+                mask_to_draw = ("manual", self._state.manual_mask)
+            elif self._state.mask_layers.hint is not None:
                 mask_to_draw = ("hint", self._state.mask_layers.hint)
             elif self._state.mask_layers.result is not None:
                 mask_to_draw = ("result", self._state.mask_layers.result)
+            elif self._state.auto_mask is not None:
+                mask_to_draw = ("auto", self._state.auto_mask)
 
         if mask_to_draw is not None:
             layer_type, mask_data = mask_to_draw
@@ -112,6 +116,27 @@ class ImageViewer(ClickableLabel):
                 marker_draw = ImageDraw.Draw(marker)
                 marker_draw.ellipse([(0, 0), (size * 2 - 1, size * 2 - 1)], fill=color)
                 overlay.paste(marker, (x - size, y - size), marker)
+
+        # 手动精修模式下的多边形预览（使用图像坐标，缩放/平移后仍能对齐）
+        if self._state.manual_edit_enabled and self._state.current_polygon_points:
+            poly_points = [tuple(pt) for pt in self._state.current_polygon_points]
+            draw = ImageDraw.Draw(overlay)
+            if len(poly_points) >= 3:
+                preview = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+                ImageDraw.Draw(preview).polygon(poly_points, fill=(255, 215, 0, 60))
+                overlay = Image.alpha_composite(overlay, preview)
+                draw = ImageDraw.Draw(overlay)
+            if len(poly_points) > 1:
+                draw.line(poly_points, fill=(255, 215, 0, 200), width=2)
+            if len(poly_points) > 2:
+                draw.line([poly_points[-1], poly_points[0]], fill=(255, 215, 0, 120), width=2)
+            for idx, (x, y) in enumerate(poly_points):
+                color = (255, 215, 0, 255) if idx == 0 else (0, 122, 255, 255)
+                size = 6 if idx == 0 else 4
+                marker = Image.new("RGBA", (size * 2, size * 2), (0, 0, 0, 0))
+                marker_draw = ImageDraw.Draw(marker)
+                marker_draw.ellipse([(0, 0), (size * 2 - 1, size * 2 - 1)], fill=color)
+                overlay.paste(marker, (int(x) - size, int(y) - size), marker)
 
         composed = Image.alpha_composite(display_image.convert("RGBA"), overlay).convert("RGB")
         pixmap = qt_convert.pil_to_qpixmap(composed)

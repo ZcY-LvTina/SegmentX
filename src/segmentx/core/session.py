@@ -28,15 +28,26 @@ class ImageState:
     display_image: Image.Image
     click_points: List[List[int]]
     labels: List[int]
+    auto_mask: Optional[np.ndarray] = None  # 模型分割掩膜
+    manual_mask: Optional[np.ndarray] = None  # 手动精修掩膜，优先作为最终结果
+    manual_edit_enabled: bool = False  # 是否处于手动精修模式
+    current_polygon_points: List[List[int]] = field(default_factory=list)  # 当前绘制的多边形（图像坐标）
+    manual_brush_mode: str = "add"  # add / erase
     mask_layers: MaskLayers = field(default_factory=MaskLayers)
 
     @property
     def mask(self) -> Optional[np.ndarray]:
-        # Backward compatibility for existing callers
+        # 优先返回手动精修后的掩膜；无手动掩膜时回退到模型结果
+        if self.manual_mask is not None:
+            return self.manual_mask
+        if self.auto_mask is not None:
+            return self.auto_mask
         return self.mask_layers.result
 
     @mask.setter
     def mask(self, value: Optional[np.ndarray]) -> None:
+        # setter 主要给模型分割结果使用，作为 auto_mask 存储
+        self.auto_mask = value
         self.mask_layers.result = value
 
     def clone(self) -> "ImageState":
@@ -46,6 +57,11 @@ class ImageState:
             display_image=self.display_image.copy(),
             click_points=[pt.copy() for pt in self.click_points],
             labels=self.labels.copy(),
+            auto_mask=self.auto_mask.copy() if self.auto_mask is not None else None,
+            manual_mask=self.manual_mask.copy() if self.manual_mask is not None else None,
+            manual_edit_enabled=self.manual_edit_enabled,
+            current_polygon_points=[pt.copy() for pt in self.current_polygon_points],
+            manual_brush_mode=self.manual_brush_mode,
             mask_layers=self.mask_layers.clone(),
         )
 

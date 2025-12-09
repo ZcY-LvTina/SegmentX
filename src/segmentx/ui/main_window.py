@@ -1,7 +1,9 @@
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QPoint
+import numpy as np
+from PIL import Image, ImageDraw
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QLabel, QHBoxLayout, QMainWindow, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..config import MAX_HISTORY
@@ -74,6 +76,10 @@ class MainWindow(QMainWindow):
         self.reset_zoom_button = QPushButton("适配窗口")
         self.foreground_button = QPushButton("前景标记")
         self.background_button = QPushButton("背景标记")
+        self.manual_mode_button = QPushButton("手动精修模式")
+        self.manual_add_button = QPushButton("多边形添加")
+        self.manual_erase_button = QPushButton("多边形擦除")
+        self.cancel_polygon_button = QPushButton("取消多边形")
         self.status_label = QLabel("状态: 等待加载图像")
         self.image_info_label = QLabel("当前图片: 0/0")
 
@@ -92,6 +98,10 @@ class MainWindow(QMainWindow):
         self.reset_zoom_button.clicked.connect(self.image_viewer.reset_view)
         self.foreground_button.clicked.connect(self.set_foreground_mode)
         self.background_button.clicked.connect(self.set_background_mode)
+        self.manual_mode_button.clicked.connect(self.toggle_manual_mode)
+        self.manual_add_button.clicked.connect(lambda: self.set_manual_brush_mode("add"))
+        self.manual_erase_button.clicked.connect(lambda: self.set_manual_brush_mode("erase"))
+        self.cancel_polygon_button.clicked.connect(self.cancel_polygon)
 
         # Initial states
         self.undo_button.setEnabled(False)
@@ -103,6 +113,11 @@ class MainWindow(QMainWindow):
         self.foreground_button.setCheckable(True)
         self.background_button.setCheckable(True)
         self.foreground_button.setChecked(True)
+        self.manual_mode_button.setEnabled(False)
+        self.manual_mode_button.setCheckable(True)
+        self.manual_add_button.setCheckable(True)
+        self.manual_erase_button.setCheckable(True)
+        self._enable_manual_controls(False)
 
         # Add to layout
         for widget in [
@@ -116,6 +131,10 @@ class MainWindow(QMainWindow):
             self.redo_button,
             self.foreground_button,
             self.background_button,
+            self.manual_mode_button,
+            self.manual_add_button,
+            self.manual_erase_button,
+            self.cancel_polygon_button,
             self.toggle_hint_button,
             self.zoom_in_button,
             self.zoom_out_button,
@@ -154,6 +173,9 @@ class MainWindow(QMainWindow):
             self.engine.clear_cache()
             self.sessions = []
             self.current_index = -1
+            self.manual_mode_button.setEnabled(False)
+            self.manual_mode_button.setChecked(False)
+            self._enable_manual_controls(False)
             for path in file_paths:
                 img = load_image(path)
                 state = ImageState(
@@ -172,6 +194,7 @@ class MainWindow(QMainWindow):
                 self._update_navigation_buttons()
                 self.save_button.setEnabled(True)
                 self.save_all_button.setEnabled(True)
+                self.manual_mode_button.setEnabled(True)
                 self.status_label.setText(f"状态: 已加载 {len(self.sessions)} 张图片")
                 self._update_image_info()
         except Exception as exc:
@@ -199,6 +222,7 @@ class MainWindow(QMainWindow):
         self.image_viewer.set_state(session.state, reset_view=reset_view)
         self._update_history_buttons()
         self._sync_hint_button(session.state.mask_layers.show_hint)
+        self._sync_manual_controls(session.state)
 
     def prev_image(self) -> None:
         if self.current_index > 0:
@@ -324,6 +348,67 @@ class MainWindow(QMainWindow):
         self.background_button.setChecked(True)
         self.status_label.setText("状态: 当前模式 - 背景标记")
 
+    def toggle_manual_mode(self) -> None:
+        session = self.current_session
+        if not session:
+            self.manual_mode_button.setChecked(False)
+            return
+
+        enable = self.manual_mode_button.isChecked()
+        session.save()
+        if enable:
+            # 进入手动模式：优先复制模型掩膜，否则从空白开始
+            if session.state.manual_mask is None:
+                base_mask = session.state.auto_mask
+                if base_mask is not None:
+                    session.state.manual_mask = base_mask.astype(bool).copy()
+                else:
+                    width, height = session.state.original_image.size
+                    session.state.manual_mask = np.zeros((height, width), dtype=bool)
+            session.state.manual_edit_enabled = True
+            session.state.current_polygon_points = []
+            if session.state.manual_brush_mode not in ["add", "erase"]:
+                session.state.manual_brush_mode = "add"
+            self._enable_manual_controls(True)
+            self.set_manual_brush_mode(session.state.manual_brush_mode, update_status=False)
+            self.status_label.setText("状态: 手动精修模式开启")
+        else:
+            session.state.manual_edit_enabled = False
+            session.state.current_polygon_points = []
+            self._enable_manual_controls(False)
+            self.manual_mode_button.setChecked(False)
+            self.status_label.setText("状态: 手动精修模式关闭")
+
+        self.image_viewer.set_state(session.state)
+        self._update_history_buttons()
+
+    def set_manual_brush_mode(self, mode: str, update_status: bool = True) -> None:
+        session = self.current_session
+        if not session:
+            return
+        if mode not in ["add", "erase"]:
+            return
+        session.state.manual_brush_mode = mode
+        self.manual_add_button.blockSignals(True)
+        self.manual_erase_button.blockSignals(True)
+        self.manual_add_button.setChecked(mode == "add")
+        self.manual_erase_button.setChecked(mode == "erase")
+        self.manual_add_button.blockSignals(False)
+        self.manual_erase_button.blockSignals(False)
+        if update_status:
+            action = "加入前景" if mode == "add" else "从前景抠除"
+            self.status_label.setText(f"状态: 多边形模式 - {action}")
+
+    def cancel_polygon(self) -> None:
+        session = self.current_session
+        if not session:
+            return
+        if not session.state.current_polygon_points:
+            return
+        session.state.current_polygon_points = []
+        self.image_viewer.set_state(session.state)
+        self.status_label.setText("状态: 已取消当前多边形")
+
     def toggle_hint_mask(self) -> None:
         session = self.current_session
         if not session:
@@ -336,6 +421,9 @@ class MainWindow(QMainWindow):
     def on_image_clicked(self, pos: QPoint) -> None:
         session = self.current_session
         if not session:
+            return
+        if session.state.manual_edit_enabled:
+            self._handle_manual_polygon_click(session, pos)
             return
         image_pos = self.image_viewer.map_to_image_coords(pos)
         if not image_pos:
@@ -356,10 +444,69 @@ class MainWindow(QMainWindow):
             if mask is None:
                 self.status_label.setText("状态: 没有足够的点击点执行分割")
                 return
+            # 分割结果作为 auto_mask，关闭手动模式时清空手动掩膜
+            session.state.auto_mask = mask.astype(bool)
+            if not session.state.manual_edit_enabled:
+                session.state.manual_mask = None
+                session.state.current_polygon_points = []
             self.status_label.setText("状态: 分割完成")
         except Exception as exc:
             show_error(self, "错误", f"分割失败: {exc}")
             self.status_label.setText("状态: 分割失败")
+
+    def _handle_manual_polygon_click(self, session: Session, pos: QPoint) -> None:
+        """手动模式下左键添加多边形顶点，闭合后生成掩膜。"""
+        image_pos = self.image_viewer.map_to_image_coords(pos)
+        if not image_pos:
+            return
+        point = (int(image_pos.x()), int(image_pos.y()))
+        points = session.state.current_polygon_points
+
+        # 距离第一个点足够近则视为闭合，直接落在第一点位置
+        if points and len(points) >= 3:
+            first = points[0]
+            dx = point[0] - first[0]
+            dy = point[1] - first[1]
+            if dx * dx + dy * dy <= 100:  # 10 像素阈值
+                session.save()
+                self._commit_polygon(session)
+                return
+
+        session.save()
+        session.state.current_polygon_points.append([point[0], point[1]])
+        self.image_viewer.set_state(session.state)
+        self.status_label.setText("状态: 已添加多边形顶点")
+        self._update_history_buttons()
+
+    def _commit_polygon(self, session: Session) -> None:
+        """闭合多边形生成掩膜，按 add/erase 逻辑与当前手动掩膜合并。"""
+        poly_points = [tuple(pt) for pt in session.state.current_polygon_points]
+        if len(poly_points) < 3:
+            return
+
+        width, height = session.state.original_image.size
+        mask_img = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(mask_img)
+        draw.polygon(poly_points, outline=1, fill=1)
+        poly_mask = np.array(mask_img, dtype=bool)
+
+        if session.state.manual_mask is None:
+            session.state.manual_mask = np.zeros((height, width), dtype=bool)
+        if session.state.manual_brush_mode == "erase":
+            session.state.manual_mask = np.logical_and(session.state.manual_mask, ~poly_mask)
+        else:
+            session.state.manual_mask = np.logical_or(session.state.manual_mask, poly_mask)
+
+        # 手动掩膜优先作为最终结果显示/保存
+        session.state.current_polygon_points = []
+        session.state.mask_layers.result = session.state.manual_mask
+        if session.state.mask_layers.show_hint:
+            session.state.mask_layers.hint = session.state.manual_mask
+
+        self.image_viewer.set_state(session.state)
+        action = "加入前景" if session.state.manual_brush_mode == "add" else "从前景抠除"
+        self.status_label.setText(f"状态: 多边形已闭合，{action}")
+        self._update_history_buttons()
 
     def update_image_display(self) -> None:
         session = self.current_session
@@ -376,10 +523,16 @@ class MainWindow(QMainWindow):
         session.state.click_points = []
         session.state.labels = []
         session.state.mask = None
+        session.state.auto_mask = None
+        session.state.manual_mask = None
+        session.state.manual_edit_enabled = False
+        session.state.current_polygon_points = []
+        session.state.manual_brush_mode = "add"
         session.state.mask_layers.hint = None
         session.state.display_image = session.state.original_image.copy()
 
         self.image_viewer.set_state(session.state)
+        self._sync_manual_controls(session.state)
         self.status_label.setText("状态: 已清除所有标记")
         self._update_history_buttons()
 
@@ -409,9 +562,13 @@ class MainWindow(QMainWindow):
             self.undo_button.setEnabled(False)
             self.redo_button.setEnabled(False)
             self._sync_hint_button(False)
+            self._enable_manual_controls(False)
+            self.manual_mode_button.setEnabled(False)
+            self.manual_mode_button.setChecked(False)
             return
         self.undo_button.setEnabled(session.can_undo())
         self.redo_button.setEnabled(session.can_redo())
+        self.manual_mode_button.setEnabled(True)
 
     def _sync_hint_button(self, show: bool) -> None:
         self.toggle_hint_button.blockSignals(True)
@@ -420,9 +577,34 @@ class MainWindow(QMainWindow):
         self.toggle_hint_button.setEnabled(bool(self.sessions))
         self.toggle_hint_button.blockSignals(False)
 
+    def _enable_manual_controls(self, enabled: bool) -> None:
+        self.manual_add_button.setEnabled(enabled)
+        self.manual_erase_button.setEnabled(enabled)
+        self.cancel_polygon_button.setEnabled(enabled)
+
+    def _sync_manual_controls(self, state: ImageState) -> None:
+        self.manual_mode_button.blockSignals(True)
+        self.manual_mode_button.setEnabled(bool(self.sessions))
+        self.manual_mode_button.setChecked(state.manual_edit_enabled)
+        self.manual_mode_button.blockSignals(False)
+        self._enable_manual_controls(state.manual_edit_enabled)
+        if state.manual_edit_enabled:
+            self.set_manual_brush_mode(state.manual_brush_mode, update_status=False)
+        else:
+            self.manual_add_button.setChecked(False)
+            self.manual_erase_button.setChecked(False)
+
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
         self.update_image_display()
+
+    def keyPressEvent(self, event):  # type: ignore[override]
+        if event.key() == Qt.Key_Escape:
+            # Esc 取消当前多边形，但不影响已有掩膜
+            self.cancel_polygon()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 __all__ = ["MainWindow"]
