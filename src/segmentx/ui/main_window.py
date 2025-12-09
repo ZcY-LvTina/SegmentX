@@ -3,10 +3,21 @@ from typing import List, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QLabel, QHBoxLayout, QMainWindow, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtCore import QPoint, Qt, QSize
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QSizePolicy,
+    QStyle,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from ..config import MAX_HISTORY
+from ..config import MAX_HISTORY, MODEL_TYPE, RESOURCES_DIR
 from ..core.export import bulk_export, save_masked_result
 from ..core.image_io import image_to_array, load_image
 from ..core.sam_engine import SamEngine
@@ -48,38 +59,38 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        main_layout = QHBoxLayout(central_widget)
-        control_panel = QWidget()
-        control_layout = QVBoxLayout(control_panel)
-        control_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # 主布局：顶部工具栏 + 下方内容区域
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # Image viewer created early so control buttons can bind zoom/reset handlers
         self.image_viewer = ImageViewer()
         self.image_viewer.setMinimumSize(800, 600)
         self.image_viewer.clicked.connect(self.on_image_clicked)
 
-        # 合并单图/多图入口后的统一加载按钮
-        self.load_button = QPushButton("加载图片")
-        self.prev_button = QPushButton("上一张 (←)")
-        self.next_button = QPushButton("下一张 (→)")
-        self.clear_button = QPushButton("清除标记")
-        self.save_button = QPushButton("保存当前结果")
-        self.save_all_button = QPushButton("保存所有结果")
-        self.undo_button = QPushButton("撤销 (Ctrl+Z)")
-        self.redo_button = QPushButton("重做 (Ctrl+Y)")
-        self.toggle_hint_button = QPushButton("隐藏提示掩膜")
+        # 左侧侧边栏按钮改为图标+文字 QToolButton
+        self.load_button = QToolButton()
+        self.prev_button = QToolButton()
+        self.next_button = QToolButton()
+        self.clear_button = QToolButton()
+        self.save_button = QToolButton()
+        self.save_all_button = QToolButton()
+        self.undo_button = QToolButton()
+        self.redo_button = QToolButton()
+        self.toggle_hint_button = QToolButton()
         self.toggle_hint_button.setCheckable(True)
         self.toggle_hint_button.setChecked(True)
         self.toggle_hint_button.setEnabled(False)
-        self.zoom_in_button = QPushButton("放大 (+)")
-        self.zoom_out_button = QPushButton("缩小 (-)")
-        self.reset_zoom_button = QPushButton("适配窗口")
-        self.foreground_button = QPushButton("前景标记")
-        self.background_button = QPushButton("背景标记")
-        self.manual_mode_button = QPushButton("手动精修模式")
-        self.manual_add_button = QPushButton("多边形添加")
-        self.manual_erase_button = QPushButton("多边形擦除")
-        self.cancel_polygon_button = QPushButton("取消多边形")
+        self.zoom_in_button = QToolButton()
+        self.zoom_out_button = QToolButton()
+        self.reset_zoom_button = QToolButton()
+        self.foreground_button = QToolButton()
+        self.background_button = QToolButton()
+        self.manual_mode_button = QToolButton()
+        self.manual_add_button = QToolButton()
+        self.manual_erase_button = QToolButton()
+        self.cancel_polygon_button = QToolButton()
         self.status_label = QLabel("状态: 等待加载图像")
         self.image_info_label = QLabel("当前图片: 0/0")
 
@@ -119,31 +130,111 @@ class MainWindow(QMainWindow):
         self.manual_erase_button.setCheckable(True)
         self._enable_manual_controls(False)
 
-        # Add to layout
-        for widget in [
+        # 顶部工具栏：左侧信息区 + 右侧分割相关按钮
+        header_bar = QFrame()
+        header_bar.setObjectName("HeaderBar")
+        header_bar.setFixedHeight(82)
+        header_layout = QHBoxLayout(header_bar)
+        header_layout.setContentsMargins(16, 10, 16, 10)
+        header_layout.setSpacing(12)
+
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(2)
+        self.title_label = QLabel("SegmentX")
+        self.title_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #1f2937;")
+        self.model_label = QLabel("当前模型：--")
+        self.model_label.setStyleSheet("font-size: 13px; color: #4b5563;")
+        self.image_count_label = QLabel("图片：0/0")
+        self.image_count_label.setStyleSheet("font-size: 13px; color: #4b5563;")
+        info_layout.addWidget(self.title_label)
+        info_layout.addWidget(self.model_label)
+        info_layout.addWidget(self.image_count_label)
+        header_layout.addLayout(info_layout)
+        header_layout.addStretch()
+
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.setSpacing(8)
+        for btn, text in [
+            (self.clear_button, "清除标记"),
+            (self.toggle_hint_button, "隐藏/显示掩膜"),
+            (self.foreground_button, "前景标记"),
+            (self.background_button, "背景标记"),
+            (self.manual_mode_button, "手动精修"),
+            (self.manual_add_button, "多边形添加"),
+            (self.manual_erase_button, "多边形擦除"),
+            (self.cancel_polygon_button, "取消多边形"),
+        ]:
+
+            icon_path = None
+            if btn is self.clear_button:
+                icon_path = RESOURCES_DIR / "icons" / "clear.png"
+            elif btn is self.toggle_hint_button:
+                icon_path = RESOURCES_DIR / "icons" / "xianshi-yincang.png"
+            elif btn is self.foreground_button:
+                icon_path = RESOURCES_DIR / "icons" / "qianjing.png"
+            elif btn is self.background_button:
+                icon_path = RESOURCES_DIR / "icons" / "houjing.png"
+            elif btn is self.manual_mode_button:
+                icon_path = RESOURCES_DIR / "icons" / "shoudong.png"
+            elif btn is self.manual_add_button:
+                icon_path = RESOURCES_DIR / "icons" / "poly_add.png"
+            elif btn is self.manual_erase_button:
+                icon_path = RESOURCES_DIR / "icons" / "poly_erase.png"
+            elif btn is self.cancel_polygon_button:
+                icon_path = RESOURCES_DIR / "icons" / "cancel.png"
+            self._setup_top_button(btn, text, icon_path)
+            toolbar_layout.addWidget(btn)
+        header_layout.addLayout(toolbar_layout)
+        main_layout.addWidget(header_bar)
+
+        # 中间内容区域：左侧侧边栏 + 图片区域
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("SideBar")
+        sidebar.setFixedWidth(140)
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(8, 12, 8, 12)
+        side_layout.setSpacing(6)
+
+        icon_size = QSize(28, 28)
+
+        self._setup_side_button(self.load_button, "加载图片", RESOURCES_DIR / "icons" / "open.png", icon_size)
+        self._setup_side_button(self.prev_button, "上一张", RESOURCES_DIR / "icons" / "prev.png", icon_size)
+        self._setup_side_button(self.next_button, "下一张", RESOURCES_DIR / "icons" / "next.png", icon_size)
+        self._setup_side_button(self.save_button, "保存结果", RESOURCES_DIR / "icons" / "save.png", icon_size)
+        self._setup_side_button(self.save_all_button, "批量保存", RESOURCES_DIR / "icons" / "save_all.png", icon_size)
+        self._setup_side_button(self.undo_button, "撤销", RESOURCES_DIR / "icons" / "undo.png", icon_size)
+        self._setup_side_button(self.redo_button, "重做", RESOURCES_DIR / "icons" / "redo.png", icon_size)
+
+        for btn in [
             self.load_button,
             self.prev_button,
             self.next_button,
-            self.clear_button,
             self.save_button,
             self.save_all_button,
             self.undo_button,
             self.redo_button,
-            self.foreground_button,
-            self.background_button,
-            self.manual_mode_button,
-            self.manual_add_button,
-            self.manual_erase_button,
-            self.cancel_polygon_button,
-            self.toggle_hint_button,
-            self.zoom_in_button,
-            self.zoom_out_button,
-            self.reset_zoom_button,
-            self.image_info_label,
-            self.status_label,
         ]:
-            control_layout.addWidget(widget)
-        main_layout.addWidget(control_panel, stretch=1)
+            side_layout.addWidget(btn)
+
+        side_layout.addSpacing(6)
+        for btn, label, icon_file in [
+            (self.zoom_in_button, "放大", "fangda.png"),
+            (self.zoom_out_button, "缩小", "suoxiao.png"),
+            (self.reset_zoom_button, "适配", "fit.png"),
+        ]:
+
+            self._setup_side_button(btn, label, RESOURCES_DIR / "icons" / icon_file, icon_size)
+            side_layout.addWidget(btn)
+
+        side_layout.addStretch()
+        side_layout.addWidget(self.image_info_label)
+        side_layout.addWidget(self.status_label)
+        content_layout.addWidget(sidebar, stretch=0)
 
         # Image area
         image_panel = QWidget()
@@ -156,7 +247,11 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding,
         )
         image_layout.addWidget(ratio_container)
-        main_layout.addWidget(image_panel, stretch=4)
+        content_layout.addWidget(image_panel, stretch=1)
+        main_layout.addWidget(content_widget, stretch=1)
+
+        self._apply_styles(sidebar, header_bar)
+        self.update_info_bar()
 
     @property
     def current_session(self) -> Optional[Session]:
@@ -253,10 +348,20 @@ class MainWindow(QMainWindow):
         self.next_button.setEnabled(self.current_index < len(self.sessions) - 1)
 
     def _update_image_info(self) -> None:
+        self.update_info_bar()
         if self.sessions:
             self.image_info_label.setText(f"当前图片: {self.current_index + 1}/{len(self.sessions)}")
         else:
             self.image_info_label.setText("当前图片: 0/0")
+
+    def update_info_bar(self) -> None:
+        """更新顶部信息栏：模型名称 + 图片进度。"""
+        model_name = getattr(self.engine, "model_type", None) or getattr(self.engine, "model_name", None) or MODEL_TYPE
+        self.model_label.setText(f"当前模型：{model_name}")
+        if self.sessions and 0 <= self.current_index < len(self.sessions):
+            self.image_count_label.setText(f"图片：{self.current_index + 1}/{len(self.sessions)}")
+        else:
+            self.image_count_label.setText("图片：0/0")
 
     def save_current_result(self) -> None:
         session = self.current_session
@@ -593,6 +698,76 @@ class MainWindow(QMainWindow):
         else:
             self.manual_add_button.setChecked(False)
             self.manual_erase_button.setChecked(False)
+
+    def _apply_styles(self, sidebar: QWidget, header: QWidget) -> None:
+        """统一顶部工具栏与左侧侧边栏的简单美化样式。"""
+        header.setStyleSheet(
+            """
+            #HeaderBar {
+                background-color: #f5f5f7;
+                border-bottom: 1px solid #ddd;
+            }
+            QToolButton#TopToolButton {
+                border: 1px solid transparent;
+                border-radius: 8px;
+                padding: 6px 10px;
+                background: transparent;
+            }
+            QToolButton#TopToolButton:hover {
+                border: 1px solid #9ae6b4;
+            }
+            QToolButton#TopToolButton:pressed,
+            QToolButton#TopToolButton:checked {
+                border: 1px solid #047857;
+            }
+            """
+        )
+        sidebar.setStyleSheet(
+            """
+            #SideBar {
+                background-color: #f8f9fb;
+                border-right: 1px solid #e0e0e0;
+            }
+            QToolButton#SideToolButton {
+                border: 1px solid transparent;
+                border-radius: 8px;
+                padding: 8px 10px;
+                margin: 4px 2px;
+                background: transparent;
+            }
+            QToolButton#SideToolButton:hover {
+                border: 1px solid #9ae6b4;
+            }
+            QToolButton#SideToolButton:pressed,
+            QToolButton#SideToolButton:checked {
+                border: 1px solid #047857;
+            }
+            """
+        )
+
+    def _setup_top_button(self, button: QToolButton, text: str, icon_path: Optional[Path]) -> None:
+        """顶部工具栏按钮：图标+文字下方，矩形边框。"""
+        button.setObjectName("TopToolButton")
+        button.setText(text)
+        button.setIcon(QIcon(str(icon_path)) if icon_path else QIcon())
+        button.setIconSize(QSize(22, 22))
+        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        button.setFixedHeight(60)
+
+    def _setup_side_button(
+        self,
+        button: QToolButton,
+        text: str,
+        icon_path: Optional[Path],
+        icon_size: QSize,
+    ) -> None:
+        """侧边栏按钮：图标+文字右侧，矩形边框。"""
+        button.setObjectName("SideToolButton")
+        button.setText(text)
+        button.setIcon(QIcon(str(icon_path)) if icon_path else QIcon())
+        button.setIconSize(icon_size)
+        button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        button.setMinimumHeight(48)
 
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
