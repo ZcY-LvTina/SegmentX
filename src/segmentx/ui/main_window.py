@@ -2,15 +2,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtWidgets import (
-    QLabel,
-    QHBoxLayout,
-    QMainWindow,
-    QPushButton,
-    QScrollArea,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QLabel, QHBoxLayout, QMainWindow, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..config import MAX_HISTORY
 from ..core.export import bulk_export, save_masked_result
@@ -27,7 +19,7 @@ from .dialogs import (
     show_info,
     show_warning,
 )
-from .image_viewer import ImageViewer
+from .image_viewer import AspectRatioContainer, ImageViewer
 from .shortcuts import setup_shortcuts
 
 
@@ -59,8 +51,13 @@ class MainWindow(QMainWindow):
         control_layout = QVBoxLayout(control_panel)
         control_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self.load_button = QPushButton("加载图像")
-        self.load_multiple_button = QPushButton("加载多个图像")
+        # Image viewer created early so control buttons can bind zoom/reset handlers
+        self.image_viewer = ImageViewer()
+        self.image_viewer.setMinimumSize(800, 600)
+        self.image_viewer.clicked.connect(self.on_image_clicked)
+
+        # 合并单图/多图入口后的统一加载按钮
+        self.load_button = QPushButton("加载图片")
         self.prev_button = QPushButton("上一张 (←)")
         self.next_button = QPushButton("下一张 (→)")
         self.clear_button = QPushButton("清除标记")
@@ -68,14 +65,20 @@ class MainWindow(QMainWindow):
         self.save_all_button = QPushButton("保存所有结果")
         self.undo_button = QPushButton("撤销 (Ctrl+Z)")
         self.redo_button = QPushButton("重做 (Ctrl+Y)")
+        self.toggle_hint_button = QPushButton("隐藏提示掩膜")
+        self.toggle_hint_button.setCheckable(True)
+        self.toggle_hint_button.setChecked(True)
+        self.toggle_hint_button.setEnabled(False)
+        self.zoom_in_button = QPushButton("放大 (+)")
+        self.zoom_out_button = QPushButton("缩小 (-)")
+        self.reset_zoom_button = QPushButton("适配窗口")
         self.foreground_button = QPushButton("前景标记")
         self.background_button = QPushButton("背景标记")
         self.status_label = QLabel("状态: 等待加载图像")
         self.image_info_label = QLabel("当前图片: 0/0")
 
         # Button wiring
-        self.load_button.clicked.connect(lambda: self.load_images(single=True))
-        self.load_multiple_button.clicked.connect(lambda: self.load_images(single=False))
+        self.load_button.clicked.connect(self.load_images)
         self.prev_button.clicked.connect(self.prev_image)
         self.next_button.clicked.connect(self.next_image)
         self.clear_button.clicked.connect(self.clear_markers)
@@ -83,6 +86,10 @@ class MainWindow(QMainWindow):
         self.save_all_button.clicked.connect(self.save_all_results)
         self.undo_button.clicked.connect(self.undo_action)
         self.redo_button.clicked.connect(self.redo_action)
+        self.toggle_hint_button.clicked.connect(self.toggle_hint_mask)
+        self.zoom_in_button.clicked.connect(lambda: self.image_viewer.zoom(1.2))
+        self.zoom_out_button.clicked.connect(lambda: self.image_viewer.zoom(1 / 1.2))
+        self.reset_zoom_button.clicked.connect(self.image_viewer.reset_view)
         self.foreground_button.clicked.connect(self.set_foreground_mode)
         self.background_button.clicked.connect(self.set_background_mode)
 
@@ -100,7 +107,6 @@ class MainWindow(QMainWindow):
         # Add to layout
         for widget in [
             self.load_button,
-            self.load_multiple_button,
             self.prev_button,
             self.next_button,
             self.clear_button,
@@ -110,6 +116,10 @@ class MainWindow(QMainWindow):
             self.redo_button,
             self.foreground_button,
             self.background_button,
+            self.toggle_hint_button,
+            self.zoom_in_button,
+            self.zoom_out_button,
+            self.reset_zoom_button,
             self.image_info_label,
             self.status_label,
         ]:
@@ -119,14 +129,14 @@ class MainWindow(QMainWindow):
         # Image area
         image_panel = QWidget()
         image_layout = QVBoxLayout(image_panel)
-        self.image_viewer = ImageViewer()
-        self.image_viewer.setMinimumSize(800, 600)
-        self.image_viewer.clicked.connect(self.on_image_clicked)
-
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(self.image_viewer)
-        image_layout.addWidget(scroll_area)
+        ratio_container = AspectRatioContainer(ratio=4 / 3)
+        ratio_container.set_child(self.image_viewer)
+        ratio_container.setMinimumSize(800, 600)
+        ratio_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        image_layout.addWidget(ratio_container)
         main_layout.addWidget(image_panel, stretch=4)
 
     @property
@@ -135,12 +145,13 @@ class MainWindow(QMainWindow):
             return self.sessions[self.current_index]
         return None
 
-    def load_images(self, single: bool = True) -> None:
-        file_paths = choose_images(self, single)
+    def load_images(self) -> None:
+        file_paths = choose_images(self)
         if not file_paths:
             return
 
         try:
+            self.engine.clear_cache()
             self.sessions = []
             self.current_index = -1
             for path in file_paths:
@@ -151,14 +162,13 @@ class MainWindow(QMainWindow):
                     display_image=img.copy(),
                     click_points=[],
                     labels=[],
-                    mask=None,
                 )
                 self.sessions.append(Session(state, max_history=MAX_HISTORY))
 
             if self.sessions:
                 self.current_index = 0
-                self._show_current_image()
-                self._set_engine_image(self.current_session.state.original_image)  # type: ignore[union-attr]
+                self._show_current_image(reset_view=True)
+                self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
                 self._update_navigation_buttons()
                 self.save_button.setEnabled(True)
                 self.save_all_button.setEnabled(True)
@@ -168,38 +178,51 @@ class MainWindow(QMainWindow):
             show_error(self, "错误", f"加载图像失败: {exc}")
             self.status_label.setText("状态: 图像加载失败")
 
-    def _set_engine_image(self, image) -> None:
+    def _set_engine_image(self, image, image_id: str) -> bool:
+        # 为多图切换复用缓存的SAM embedding，减少重复编码开销
         try:
-            self.engine.set_image(image_to_array(image))
+            self.status_label.setText("状态: 正在准备图像特征")
+            from_cache = self.engine.set_image(image_to_array(image), image_id=image_id)
+            status = "状态: 使用缓存的图像特征" if from_cache else "状态: 已准备图像特征"
+            self.status_label.setText(status)
+            return from_cache
         except Exception as exc:
             show_error(self, "错误", f"设置图像到SAM模型失败: {exc}")
+            return False
 
-    def _show_current_image(self) -> None:
+    def _show_current_image(self, reset_view: bool = False) -> None:
         session = self.current_session
         if not session:
             return
         session.undo_stack.clear()
         session.redo_stack.clear()
-        self.image_viewer.set_state(session.state)
+        self.image_viewer.set_state(session.state, reset_view=reset_view)
         self._update_history_buttons()
+        self._sync_hint_button(session.state.mask_layers.show_hint)
 
     def prev_image(self) -> None:
         if self.current_index > 0:
             self.current_index -= 1
-            self._show_current_image()
-            self._set_engine_image(self.current_session.state.original_image)  # type: ignore[union-attr]
+            self._show_current_image(reset_view=False)
+            from_cache = self._set_engine_image(
+                self.current_session.state.original_image, self.current_session.state.path
+            )  # type: ignore[union-attr]
             self._update_navigation_buttons()
             self._update_image_info()
-            self.status_label.setText("状态: 切换到上一张图片")
+            status = "状态: 切换到上一张图片 (缓存特征)" if from_cache else "状态: 切换到上一张图片"
+            self.status_label.setText(status)
 
     def next_image(self) -> None:
         if self.current_index < len(self.sessions) - 1:
             self.current_index += 1
-            self._show_current_image()
-            self._set_engine_image(self.current_session.state.original_image)  # type: ignore[union-attr]
+            self._show_current_image(reset_view=False)
+            from_cache = self._set_engine_image(
+                self.current_session.state.original_image, self.current_session.state.path
+            )  # type: ignore[union-attr]
             self._update_navigation_buttons()
             self._update_image_info()
-            self.status_label.setText("状态: 切换到下一张图片")
+            status = "状态: 切换到下一张图片 (缓存特征)" if from_cache else "状态: 切换到下一张图片"
+            self.status_label.setText(status)
 
     def _update_navigation_buttons(self) -> None:
         self.prev_button.setEnabled(self.current_index > 0)
@@ -301,6 +324,15 @@ class MainWindow(QMainWindow):
         self.background_button.setChecked(True)
         self.status_label.setText("状态: 当前模式 - 背景标记")
 
+    def toggle_hint_mask(self) -> None:
+        session = self.current_session
+        if not session:
+            return
+        session.state.mask_layers.show_hint = not session.state.mask_layers.show_hint
+        self._sync_hint_button(session.state.mask_layers.show_hint)
+        # Render without mutating underlying image; hint layer remains data-only
+        self.image_viewer.set_state(session.state)
+
     def on_image_clicked(self, pos: QPoint) -> None:
         session = self.current_session
         if not session:
@@ -344,6 +376,7 @@ class MainWindow(QMainWindow):
         session.state.click_points = []
         session.state.labels = []
         session.state.mask = None
+        session.state.mask_layers.hint = None
         session.state.display_image = session.state.original_image.copy()
 
         self.image_viewer.set_state(session.state)
@@ -375,9 +408,17 @@ class MainWindow(QMainWindow):
         if not session:
             self.undo_button.setEnabled(False)
             self.redo_button.setEnabled(False)
+            self._sync_hint_button(False)
             return
         self.undo_button.setEnabled(session.can_undo())
         self.redo_button.setEnabled(session.can_redo())
+
+    def _sync_hint_button(self, show: bool) -> None:
+        self.toggle_hint_button.blockSignals(True)
+        self.toggle_hint_button.setChecked(show)
+        self.toggle_hint_button.setText("隐藏提示掩膜" if show else "显示提示掩膜")
+        self.toggle_hint_button.setEnabled(bool(self.sessions))
+        self.toggle_hint_button.blockSignals(False)
 
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)

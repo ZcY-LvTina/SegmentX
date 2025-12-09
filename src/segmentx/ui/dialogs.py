@@ -17,12 +17,10 @@ def show_info(parent: QWidget, title: str, message: str) -> None:
     QMessageBox.information(parent, title, message)
 
 
-def choose_images(parent: QWidget, single: bool) -> list[str]:
+def choose_images(parent: QWidget) -> list[str]:
+    """统一的图片选择入口，支持单选和多选。"""
     options = QFileDialog.Option.ReadOnly
-    if single:
-        path, _ = QFileDialog.getOpenFileName(parent, "选择医学影像", "", FILE_DIALOG_FILTER, options=options)
-        return [path] if path else []
-    paths, _ = QFileDialog.getOpenFileNames(parent, "选择多个医学影像", "", FILE_DIALOG_FILTER, options=options)
+    paths, _ = QFileDialog.getOpenFileNames(parent, "选择医学影像", "", FILE_DIALOG_FILTER, options=options)
     return paths
 
 
