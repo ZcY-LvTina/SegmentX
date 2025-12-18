@@ -1,15 +1,24 @@
+import json
+import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPoint, Qt, QSize
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QPoint, Qt, QSize, QThread, Signal, QObject, QUrl, QMetaObject, Q_ARG, Slot
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QCheckBox,
+    QComboBox,
+    QInputDialog,
     QSizePolicy,
     QStyle,
     QToolButton,
@@ -17,17 +26,39 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import MAX_HISTORY, MODEL_TYPE, RESOURCES_DIR
+from ..config import (
+    MAX_HISTORY,
+    MODEL_TYPE,
+    RESOURCES_DIR,
+    MODELS_DIR,
+    IMPORT_PREFERENCES_FILE,
+    NNUNET_PREDICT_CMD,
+    NNUNET_TRAIN_CMD,
+    NNUNET_SETTINGS_FILE,
+)
+from ..data.import_classifier import (
+    ClassificationResult,
+    ImportClassifier,
+    ImportPreferences,
+    PngSeriesGroup,
+    ResourceItem,
+)
+from ..data.volume_loader import VolumeLoader, Volume3D
 from ..core.export import bulk_export, save_masked_result
 from ..core.image_io import image_to_array, load_image
 from ..core.sam_engine import SamEngine
 from ..core.segmentation_pipeline import run_segmentation
 from ..core.session import ImageState, Session
+from ..models import ModelRegistry, ModelRecord
+from ..models.downloader import DownloadCancelled, download_file
+from ..models.nnunet import NNUNetAdapter, TrainConfig, TrainRunner
 from .dialogs import (
     choose_directory,
     choose_format,
-    choose_images,
+    choose_import_paths,
+    choose_folder,
     choose_save_path,
+    choose_zip_file,
     show_error,
     show_info,
     show_warning,
@@ -36,10 +67,43 @@ from .image_viewer import AspectRatioContainer, ImageViewer
 from .shortcuts import setup_shortcuts
 
 
-class MainWindow(QMainWindow):
-    def __init__(self, engine: SamEngine):
+class TaskWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+    status = Signal(str)
+    progress = Signal(int)
+    log = Signal(str)
+
+    def __init__(self, fn):
         super().__init__()
+        self.fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self.fn(self)
+            self.finished.emit(result)
+        except Exception as exc:  # pragma: no cover - UI path
+            self.failed.emit(str(exc))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, registry: ModelRegistry, engine: Optional[SamEngine] = None):
+        super().__init__()
+        self.registry = registry
         self.engine = engine
+        self.nnunet_predict_cmd = NNUNET_PREDICT_CMD
+        self.nnunet_train_cmd = NNUNET_TRAIN_CMD
+        self._load_nnunet_settings()
+        self.nnunet_adapter = NNUNetAdapter(self.registry, predict_cmd=self.nnunet_predict_cmd)
+        self.train_runner = TrainRunner(self.registry, train_cmd=self.nnunet_train_cmd)
+        self.current_model_id: Optional[str] = None
+        self.current_volume: Optional[Volume3D] = None
+        self.model_records: Dict[str, ModelRecord] = {}
+        self._background_threads: List[QThread] = []
+        self.volume_loader = VolumeLoader()
+        self.import_preferences = ImportPreferences(IMPORT_PREFERENCES_FILE)
+        self.resources: List[ResourceItem] = []
+        self.volume_resources: List[ResourceItem] = []
         self.sessions: List[Session] = []
         self.current_index: int = -1
         self.current_mode: str = "foreground"
@@ -54,6 +118,7 @@ class MainWindow(QMainWindow):
             prev_cb=self.prev_image,
             next_cb=self.next_image,
         )
+        self._refresh_model_list()
 
     def _init_ui(self) -> None:
         central_widget = QWidget()
@@ -92,7 +157,15 @@ class MainWindow(QMainWindow):
         self.manual_erase_button = QToolButton()
         self.cancel_polygon_button = QToolButton()
         self.status_label = QLabel("状态: 等待加载图像")
-        self.image_info_label = QLabel("当前图片: 0/0")
+        self.model_install_button = QToolButton()
+        self.model_import_zip_button = QToolButton()
+        self.model_import_nnunet_button = QToolButton()
+        self.model_remove_button = QToolButton()
+        self.model_open_dir_button = QToolButton()
+        self.run_nnunet_button = QToolButton()
+        self.nnunet_settings_button = QToolButton()
+        self.run_nnunet_train_button = QToolButton()
+        self.model_menu_button = QToolButton()
 
         # Button wiring
         self.load_button.clicked.connect(self.load_images)
@@ -113,6 +186,7 @@ class MainWindow(QMainWindow):
         self.manual_add_button.clicked.connect(lambda: self.set_manual_brush_mode("add"))
         self.manual_erase_button.clicked.connect(lambda: self.set_manual_brush_mode("erase"))
         self.cancel_polygon_button.clicked.connect(self.cancel_polygon)
+        self._build_model_menu()
 
         # Initial states
         self.undo_button.setEnabled(False)
@@ -140,15 +214,24 @@ class MainWindow(QMainWindow):
 
         info_layout = QVBoxLayout()
         info_layout.setSpacing(2)
-        self.title_label = QLabel("SegmentX")
-        self.title_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #1f2937;")
-        self.model_label = QLabel("当前模型：--")
-        self.model_label.setStyleSheet("font-size: 13px; color: #4b5563;")
-        self.image_count_label = QLabel("图片：0/0")
-        self.image_count_label.setStyleSheet("font-size: 13px; color: #4b5563;")
-        info_layout.addWidget(self.title_label)
-        info_layout.addWidget(self.model_label)
-        info_layout.addWidget(self.image_count_label)
+        self.model_combo = QComboBox()
+        self.model_combo.setPlaceholderText("选择模型")
+        self.model_combo.setMinimumContentsLength(14)
+        self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.model_combo.setMaximumWidth(260)
+        view = getattr(self.model_combo, "view", None)
+        if view:
+            combo_view = view()
+            if hasattr(combo_view, "setTextElideMode"):
+                combo_view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.model_combo.currentIndexChanged.connect(self._on_model_selected)
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
+        self.refresh_models_button = QPushButton("刷新模型列表")
+        self.refresh_models_button.clicked.connect(self._refresh_model_list)
+        model_row.addWidget(self.model_combo, stretch=1)
+        model_row.addWidget(self.refresh_models_button, stretch=0)
+        info_layout.addLayout(model_row)
         header_layout.addLayout(info_layout)
         header_layout.addStretch()
 
@@ -231,9 +314,13 @@ class MainWindow(QMainWindow):
             self._setup_side_button(btn, label, RESOURCES_DIR / "icons" / icon_file, icon_size)
             side_layout.addWidget(btn)
 
+        # 模型管理区域（下拉菜单）
+        side_layout.addSpacing(8)
+        self._setup_side_button(self.model_menu_button, "设置", RESOURCES_DIR / "icons" / "setting.png", icon_size)
+        self.model_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        side_layout.addWidget(self.model_menu_button)
+
         side_layout.addStretch()
-        side_layout.addWidget(self.image_info_label)
-        side_layout.addWidget(self.status_label)
         content_layout.addWidget(sidebar, stretch=0)
 
         # Image area
@@ -250,6 +337,28 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(image_panel, stretch=1)
         main_layout.addWidget(content_widget, stretch=1)
 
+        # Bottom status bar
+        bottom_bar = QFrame()
+        bottom_bar.setObjectName("BottomBar")
+        bottom_layout = QHBoxLayout(bottom_bar)
+        bottom_layout.setContentsMargins(12, 6, 12, 6)
+        bottom_layout.setSpacing(16)
+        self.model_status_label = QLabel("当前模型：--")
+        self.model_status_label.setStyleSheet("font-size: 12px; color: #374151;")
+        self.model_status_label.setMaximumWidth(320)
+        self.image_count_label = QLabel("图片：0/0")
+        self.image_count_label.setStyleSheet("font-size: 12px; color: #374151;")
+        self.volume_count_label = QLabel("体数据：0")
+        self.volume_count_label.setStyleSheet("font-size: 12px; color: #374151;")
+        self.status_label.setStyleSheet("font-size: 12px; color: #111827;")
+
+        bottom_layout.addWidget(self.model_status_label)
+        bottom_layout.addWidget(self.image_count_label)
+        bottom_layout.addWidget(self.volume_count_label)
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.status_label)
+        main_layout.addWidget(bottom_bar, stretch=0)
+
         self._apply_styles(sidebar, header_bar)
         self.update_info_bar()
 
@@ -260,44 +369,124 @@ class MainWindow(QMainWindow):
         return None
 
     def load_images(self) -> None:
-        file_paths = choose_images(self)
-        if not file_paths:
+        import_paths = choose_import_paths(self)
+        if not import_paths:
             return
 
         try:
-            self.engine.clear_cache()
-            self.sessions = []
-            self.current_index = -1
-            self.manual_mode_button.setEnabled(False)
-            self.manual_mode_button.setChecked(False)
-            self._enable_manual_controls(False)
-            for path in file_paths:
-                img = load_image(path)
-                state = ImageState(
-                    path=path,
-                    original_image=img,
-                    display_image=img.copy(),
-                    click_points=[],
-                    labels=[],
-                )
-                self.sessions.append(Session(state, max_history=MAX_HISTORY))
+            if self.engine:
+                self.engine.clear_cache()
 
-            if self.sessions:
-                self.current_index = 0
-                self._show_current_image(reset_view=True)
-                self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
-                self._update_navigation_buttons()
-                self.save_button.setEnabled(True)
-                self.save_all_button.setEnabled(True)
-                self.manual_mode_button.setEnabled(True)
-                self.status_label.setText(f"状态: 已加载 {len(self.sessions)} 张图片")
-                self._update_image_info()
+            classifier = ImportClassifier(self.import_preferences)
+            result = classifier.classify(import_paths)
+            if result.ambiguous:
+                resolved_series: List[ResourceItem] = []
+                resolved_images: List[ResourceItem] = []
+                for group in result.ambiguous:
+                    decision, remember = self._ask_series_resolution(group)
+                    if decision is None:
+                        continue
+                    if remember:
+                        self.import_preferences.remember(
+                            group.decision_key(), "volume" if decision == "series" else "images"
+                        )
+                    if decision == "series":
+                        resolved_series.append(group.as_series_resource())
+                    else:
+                        resolved_images.extend(group.as_image_resources())
+                result.series3d.extend(resolved_series)
+                result.images2d.extend(resolved_images)
+                result.ambiguous = []
+
+            self._apply_import_result(result)
         except Exception as exc:
             show_error(self, "错误", f"加载图像失败: {exc}")
             self.status_label.setText("状态: 图像加载失败")
 
+    def _apply_import_result(self, result: ClassificationResult) -> None:
+        """Apply classified resources to UI state."""
+        self.resources = result.all_resources()
+        self.volume_resources = result.series3d + result.volumes3d + result.dicom
+        self.sessions = []
+        self.current_index = -1
+        self.manual_mode_button.setEnabled(False)
+        self.manual_mode_button.setChecked(False)
+        self._enable_manual_controls(False)
+        self.toggle_hint_button.setEnabled(False)
+
+        for item in result.images2d:
+            if not item.paths:
+                continue
+            path = item.paths[0]
+            img = load_image(path)
+            state = ImageState(
+                path=path,
+                original_image=img,
+                display_image=img.copy(),
+                click_points=[],
+                labels=[],
+            )
+            self.sessions.append(Session(state, max_history=MAX_HISTORY))
+
+        if self.sessions:
+            self.current_index = 0
+            self._show_current_image(reset_view=True)
+            if self.engine:
+                self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
+            else:
+                self.status_label.setText("状态: 已加载图像，但未选择SAM模型")
+        else:
+            self.image_viewer.reset_view()
+
+        self._update_navigation_buttons()
+        self._update_history_buttons()
+        self.save_button.setEnabled(bool(self.sessions))
+        self.save_all_button.setEnabled(bool(self.sessions))
+        self.manual_mode_button.setEnabled(bool(self.sessions))
+        self.toggle_hint_button.setEnabled(bool(self.sessions))
+        self._update_image_info()
+        hint_state = self.current_session.state.mask_layers.show_hint if self.current_session else False  # type: ignore[union-attr]
+        self._sync_hint_button(hint_state)
+
+        image_count = len(self.sessions)
+        volume_count = len(self.volume_resources)
+        if image_count or volume_count:
+            if image_count:
+                self.status_label.setText(f"状态: 已加载 {image_count} 张图片，体数据 {volume_count} 个")
+            else:
+                self.status_label.setText(f"状态: 已加载体数据 {volume_count} 个，当前不支持预览")
+        else:
+            self.status_label.setText("状态: 未找到可导入的文件")
+
+    def _ask_series_resolution(self, group: PngSeriesGroup) -> tuple[Optional[str], bool]:
+        text = (
+            f"检测到可能的 3D 序列：{group.parent.name}/{group.prefix} "
+            f"共 {len(group.paths)} 张{group.ext}，连续率 {group.scores.get('contiguous_ratio', 0):.2f}，"
+            f"尺寸 {group.size[0]}x{group.size[1]}"
+        )
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("处理 PNG/JPEG 序列")
+        dialog.setText(text)
+        dialog.setInformativeText("请选择将其作为 3D 序列还是 2D 图片集导入。")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        as_volume = dialog.addButton("作为 3D 序列", QMessageBox.ButtonRole.AcceptRole)
+        as_images = dialog.addButton("作为 2D 图片集", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.addButton("跳过", QMessageBox.ButtonRole.RejectRole)
+        remember_box = QCheckBox("记住该目录/前缀的选择")
+        dialog.setCheckBox(remember_box)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is as_volume:
+            return "series", remember_box.isChecked()
+        if clicked is as_images:
+            return "images", remember_box.isChecked()
+        return None, False
+
     def _set_engine_image(self, image, image_id: str) -> bool:
         # 为多图切换复用缓存的SAM embedding，减少重复编码开销
+        if not self.engine:
+            show_warning(self, "提示", "当前未加载 SAM 模型，无法执行交互分割。请在顶部选择 SAM 模型。")
+            return False
         try:
             self.status_label.setText("状态: 正在准备图像特征")
             from_cache = self.engine.set_image(image_to_array(image), image_id=image_id)
@@ -323,9 +512,11 @@ class MainWindow(QMainWindow):
         if self.current_index > 0:
             self.current_index -= 1
             self._show_current_image(reset_view=False)
-            from_cache = self._set_engine_image(
-                self.current_session.state.original_image, self.current_session.state.path
-            )  # type: ignore[union-attr]
+            from_cache = False
+            if self.engine:
+                from_cache = self._set_engine_image(
+                    self.current_session.state.original_image, self.current_session.state.path
+                )  # type: ignore[union-attr]
             self._update_navigation_buttons()
             self._update_image_info()
             status = "状态: 切换到上一张图片 (缓存特征)" if from_cache else "状态: 切换到上一张图片"
@@ -335,9 +526,11 @@ class MainWindow(QMainWindow):
         if self.current_index < len(self.sessions) - 1:
             self.current_index += 1
             self._show_current_image(reset_view=False)
-            from_cache = self._set_engine_image(
-                self.current_session.state.original_image, self.current_session.state.path
-            )  # type: ignore[union-attr]
+            from_cache = False
+            if self.engine:
+                from_cache = self._set_engine_image(
+                    self.current_session.state.original_image, self.current_session.state.path
+                )  # type: ignore[union-attr]
             self._update_navigation_buttons()
             self._update_image_info()
             status = "状态: 切换到下一张图片 (缓存特征)" if from_cache else "状态: 切换到下一张图片"
@@ -349,19 +542,34 @@ class MainWindow(QMainWindow):
 
     def _update_image_info(self) -> None:
         self.update_info_bar()
-        if self.sessions:
-            self.image_info_label.setText(f"当前图片: {self.current_index + 1}/{len(self.sessions)}")
-        else:
-            self.image_info_label.setText("当前图片: 0/0")
+
+    def _current_model_display(self) -> str:
+        if self.current_model_id == "__legacy_sam__":
+            return "SAM (config)"
+        record = self.model_records.get(self.current_model_id or "")
+        if record and record.manifest:
+            return f"{record.manifest.name} ({record.manifest.type})"
+        if self.engine:
+            name = getattr(self.engine, "model_name", None) or getattr(self.engine, "model_type", None)
+            if name:
+                return str(name)
+        return ""
 
     def update_info_bar(self) -> None:
         """更新顶部信息栏：模型名称 + 图片进度。"""
-        model_name = getattr(self.engine, "model_type", None) or getattr(self.engine, "model_name", None) or MODEL_TYPE
-        self.model_label.setText(f"当前模型：{model_name}")
+        model_name = self._current_model_display() or MODEL_TYPE
+        self._set_elided_label(self.model_status_label, f"当前模型：{model_name}")
         if self.sessions and 0 <= self.current_index < len(self.sessions):
             self.image_count_label.setText(f"图片：{self.current_index + 1}/{len(self.sessions)}")
         else:
             self.image_count_label.setText("图片：0/0")
+        self.volume_count_label.setText(f"体数据：{len(self.volume_resources)}")
+
+    def _set_elided_label(self, label: QLabel, text: str, fallback_width: int = 280) -> None:
+        width = label.width() or label.maximumWidth() or fallback_width
+        elided = label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, width)
+        label.setText(elided)
+        label.setToolTip(text)
 
     def save_current_result(self) -> None:
         session = self.current_session
@@ -544,6 +752,9 @@ class MainWindow(QMainWindow):
 
     def _run_segmentation(self, session: Session) -> None:
         try:
+            if not self.engine:
+                show_warning(self, "提示", "当前未加载 SAM 模型，无法执行交互分割。")
+                return
             self.status_label.setText("状态: 正在执行分割...")
             mask = run_segmentation(session, self.engine)
             if mask is None:
@@ -698,6 +909,411 @@ class MainWindow(QMainWindow):
         else:
             self.manual_add_button.setChecked(False)
             self.manual_erase_button.setChecked(False)
+
+    # ---------------- Model registry + tasks ----------------
+    def _build_model_menu(self) -> None:
+        menu = QMenu(self)
+        nnunet_menu = menu.addMenu("nnU-Net 模型管理")
+        actions = {
+            "install_default": nnunet_menu.addAction("安装默认模型", self.install_default_model),
+            "install_zip": nnunet_menu.addAction("安装模型包", self.install_model_zip),
+            "import_nnunet": nnunet_menu.addAction("导入原生nnU-Net", self.import_nnunet_native),
+            "run_nnunet": nnunet_menu.addAction("nnU-Net推理", self.run_nnunet_inference),
+            "train_nnunet": nnunet_menu.addAction("nnU-Net训练", self.start_nnunet_training),
+            "nnunet_settings": nnunet_menu.addAction("nnU-Net设置", self.configure_nnunet_commands),
+            "open_dir": nnunet_menu.addAction("打开模型目录", self.open_selected_model_dir),
+            "remove": nnunet_menu.addAction("移除模型", self.remove_selected_model),
+        }
+        actions["run_nnunet"].setEnabled(False)
+        actions["remove"].setEnabled(False)
+        self.menu_actions = actions
+        self.model_menu_button.setMenu(menu)
+
+    def _load_nnunet_settings(self) -> None:
+        if NNUNET_SETTINGS_FILE.exists():
+            try:
+                data = json.loads(NNUNET_SETTINGS_FILE.read_text(encoding="utf-8"))
+                self.nnunet_predict_cmd = data.get("predict_cmd", self.nnunet_predict_cmd)
+                self.nnunet_train_cmd = data.get("train_cmd", self.nnunet_train_cmd)
+            except Exception:
+                # ignore parse error, keep defaults
+                pass
+
+    def _save_nnunet_settings(self) -> None:
+        payload = {"predict_cmd": self.nnunet_predict_cmd, "train_cmd": self.nnunet_train_cmd}
+        NNUNET_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        NNUNET_SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def configure_nnunet_commands(self) -> None:
+        predict_cmd, ok = QInputDialog.getText(
+            self, "配置 nnU-Net 命令", "预测命令 (nnUNetv2_predict):", text=self.nnunet_predict_cmd
+        )
+        if not ok:
+            return
+        train_cmd, ok = QInputDialog.getText(
+            self, "配置 nnU-Net 命令", "训练命令 (nnUNetv2_train):", text=self.nnunet_train_cmd
+        )
+        if not ok:
+            return
+        if predict_cmd:
+            self.nnunet_predict_cmd = predict_cmd
+        if train_cmd:
+            self.nnunet_train_cmd = train_cmd
+        self._save_nnunet_settings()
+        self.nnunet_adapter = NNUNetAdapter(self.registry, predict_cmd=self.nnunet_predict_cmd)
+        self.train_runner = TrainRunner(self.registry, train_cmd=self.nnunet_train_cmd)
+        show_info(self, "完成", "nnU-Net 命令已更新")
+
+    def _refresh_model_list(self) -> None:
+        self.registry.refresh()
+        records = self.registry.list_models()
+        self.model_records = {}
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for rec in records:
+            model_id = rec.id or rec.path.name
+            self.model_records[model_id] = rec
+            if rec.manifest:
+                label = f"{rec.manifest.name} ({rec.manifest.type})"
+            else:
+                label = f"{model_id} [损坏]"
+            self.model_combo.addItem(label, userData=model_id)
+            tooltip = rec.error or label
+            self.model_combo.setItemData(self.model_combo.count() - 1, tooltip, Qt.ItemDataRole.ToolTipRole)
+        self.model_combo.addItem("SAM (config)", userData="__legacy_sam__")
+        self.model_combo.blockSignals(False)
+        if self.model_combo.count() > 0:
+            target_index = 0
+            if self.current_model_id:
+                for idx in range(self.model_combo.count()):
+                    if self.model_combo.itemData(idx) == self.current_model_id:
+                        target_index = idx
+                        break
+            self.model_combo.setCurrentIndex(target_index)
+            self._on_model_selected(target_index)
+        else:
+            self.current_model_id = None
+            self.update_info_bar()
+
+    def _on_model_selected(self, index: int) -> None:
+        if index < 0:
+            return
+        model_id = self.model_combo.itemData(index)
+        self.model_combo.setToolTip(self.model_combo.currentText())
+        self.current_model_id = model_id
+        # 更新菜单可用性
+        if hasattr(self, "menu_actions"):
+            self.menu_actions["remove"].setEnabled(bool(model_id and model_id != "__legacy_sam__"))
+            self.menu_actions["open_dir"].setEnabled(True)
+            self.menu_actions["run_nnunet"].setEnabled(False)
+        if model_id == "__legacy_sam__":
+            if self.engine is None:
+                try:
+                    self.engine = SamEngine()
+                except Exception as exc:
+                    show_error(self, "错误", f"加载默认 SAM 模型失败: {exc}")
+            self.status_label.setText("状态: 使用配置中的 SAM 模型")
+            self.update_info_bar()
+            return
+        record = self.model_records.get(model_id, None)
+        if not record:
+            return
+        if record.error:
+            self.status_label.setText(f"状态: 模型损坏 - {record.error}")
+            self.update_info_bar()
+            return
+        manifest = record.manifest
+        if not manifest:
+            return
+        if manifest.type.lower() == "sam":
+            try:
+                checkpoint_path = record.path / manifest.entry
+                model_type = manifest.extra.get("model_type", MODEL_TYPE)
+                self.engine = SamEngine(checkpoint=checkpoint_path, model_type=model_type)
+                self.status_label.setText(f"状态: 已加载 SAM 模型 {manifest.name}")
+            except Exception as exc:
+                show_error(self, "错误", f"加载 SAM 模型失败: {exc}")
+        elif manifest.type.lower() == "nnunet":
+            self.engine = None
+            if hasattr(self, "menu_actions"):
+                self.menu_actions["run_nnunet"].setEnabled(True)
+            self.status_label.setText(f"状态: 已选择 nnU-Net 模型 {manifest.name}")
+        else:
+            self.status_label.setText(f"状态: 已选择模型 {manifest.name}")
+        self.update_info_bar()
+
+    def _start_task(
+        self, fn, on_success=None, error_title: str = "错误", progress_dialog: Optional[QProgressDialog] = None
+    ):
+        worker = TaskWorker(fn)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status.connect(lambda msg: self._update_status(msg), Qt.ConnectionType.QueuedConnection)
+        if progress_dialog:
+            worker.progress.connect(progress_dialog.setValue, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(
+            lambda result: self._task_finished(thread, worker, on_success, progress_dialog, result),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.failed.connect(
+            lambda msg: self._task_failed(thread, worker, error_title, progress_dialog, msg),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        thread.start()
+        self._background_threads.append(thread)
+        # Keep worker alive
+        thread.worker = worker  # type: ignore[attr-defined]
+        if progress_dialog:
+            progress_dialog.setValue(0)
+        return worker, thread
+
+    def _task_finished(
+        self,
+        thread: QThread,
+        worker: TaskWorker,
+        on_success,
+        progress_dialog: Optional[QProgressDialog],
+        result,
+    ) -> None:
+        if progress_dialog:
+            self._close_dialog_async(progress_dialog)
+        thread.quit()
+        if thread is not QThread.currentThread():
+            thread.wait()
+        if thread in self._background_threads:
+            self._background_threads.remove(thread)
+        if on_success:
+            on_success(result)
+
+    def _task_failed(
+        self,
+        thread: QThread,
+        worker: TaskWorker,
+        title: str,
+        progress_dialog: Optional[QProgressDialog],
+        message: str,
+    ) -> None:
+        if progress_dialog:
+            self._close_dialog_async(progress_dialog)
+        thread.quit()
+        if thread is not QThread.currentThread():
+            thread.wait()
+        if thread in self._background_threads:
+            self._background_threads.remove(thread)
+        self._show_dialog_async("error", title, message)
+        self.status_label.setText(f"状态: {message}")
+
+    def _close_dialog_async(self, dialog: QProgressDialog) -> None:
+        if dialog is None:
+            return
+        QMetaObject.invokeMethod(dialog, "close", Qt.ConnectionType.QueuedConnection)
+
+    @Slot(str, str, str)
+    def _show_dialog(self, kind: str, title: str, message: str) -> None:
+        if kind == "error":
+            show_error(self, title, message)
+        elif kind == "warning":
+            show_warning(self, title, message)
+        else:
+            show_info(self, title, message)
+
+    def _show_dialog_async(self, kind: str, title: str, message: str) -> None:
+        QMetaObject.invokeMethod(
+            self,
+            "_show_dialog",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(str, kind),
+            Q_ARG(str, title),
+            Q_ARG(str, message),
+        )
+
+    def _update_status(self, text: str) -> None:
+        self.status_label.setText(f"状态: {text}")
+
+    def _on_install_success(self, manifest) -> None:
+        if manifest:
+            self._show_dialog_async("info", "成功", f"模型 {manifest.name} 已安装")
+        self._refresh_model_list()
+
+    def install_default_model(self) -> None:
+        try:
+            sources = self.registry.list_default_sources()
+        except Exception as exc:
+            self._show_dialog_async("error", "错误", f"读取 sources 列表失败: {exc}")
+            return
+        if not sources:
+            self._show_dialog_async("warning", "提示", "未找到 model_store/sources.yaml/json，无法安装默认模型。")
+            return
+        model_ids = [entry.get("model_id") or entry.get("id") for entry in sources]
+        model_ids = [mid for mid in model_ids if mid]
+        if not model_ids:
+            self._show_dialog_async("warning", "提示", "sources 中没有可用的 model_id。")
+            return
+        from PySide6.QtWidgets import QInputDialog
+
+        model_id, ok = QInputDialog.getItem(self, "安装默认模型", "选择模型:", model_ids, 0, False)
+        if not ok or not model_id:
+            return
+
+        cancel_event = threading.Event()
+
+        def task(worker: TaskWorker):
+            def progress_cb(downloaded: int, total: Optional[int]) -> None:
+                percent = int(downloaded * 100 / total) if total else 0
+                worker.progress.emit(percent)
+                worker.status.emit(f"下载中 {downloaded}/{total or '?'} bytes")
+
+            try:
+                manifest, error = self.registry.download_and_install_default(
+                    model_id,
+                    downloader=lambda url, dest: download_file(
+                        url, dest, progress_cb=progress_cb, cancel_event=cancel_event, timeout=8.0
+                    ),
+                )
+            except DownloadCancelled:
+                raise RuntimeError("下载已取消")
+            if error:
+                raise RuntimeError(error)
+            return manifest
+
+        progress = QProgressDialog("正在下载模型...", "取消", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.canceled.connect(lambda: cancel_event.set(), Qt.ConnectionType.QueuedConnection)
+        progress.show()
+        worker, _ = self._start_task(task, on_success=self._on_install_success, progress_dialog=progress)
+
+    def install_model_zip(self) -> None:
+        path = choose_zip_file(self, "选择模型包 zip")
+        if not path:
+            return
+
+        def task(worker: TaskWorker):
+            worker.status.emit("正在安装模型包...")
+            return self.registry.install_from_zip(Path(path))
+
+        self._start_task(task, on_success=self._on_install_success)
+
+    def import_nnunet_native(self) -> None:
+        choice = QMessageBox(self)
+        choice.setWindowTitle("导入 nnU-Net")
+        choice.setText("选择 nnU-Net 结果来源类型")
+        choice.setIcon(QMessageBox.Icon.Question)
+        btn_zip = choice.addButton("zip 文件", QMessageBox.ButtonRole.ActionRole)
+        btn_dir = choice.addButton("目录", QMessageBox.ButtonRole.ActionRole)
+        choice.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        choice.exec()
+
+        clicked = choice.clickedButton()
+        if clicked is btn_zip:
+            path = choose_zip_file(self, "选择 nnU-Net zip")
+        elif clicked is btn_dir:
+            path = choose_folder(self, "选择 nnU-Net 目录")
+        else:
+            path = ""
+        if not path:
+            return
+
+        def task(worker: TaskWorker):
+            worker.status.emit("正在导入 nnU-Net 结果...")
+            return self.registry.import_nnunet_native(Path(path))
+
+        self._start_task(task, on_success=self._on_install_success)
+
+    def remove_selected_model(self) -> None:
+        if not self.current_model_id or self.current_model_id == "__legacy_sam__":
+            return
+        try:
+            self.registry.remove(self.current_model_id)
+            self.status_label.setText(f"状态: 已移除模型 {self.current_model_id}")
+            self._refresh_model_list()
+        except Exception as exc:
+            show_error(self, "错误", f"移除模型失败: {exc}")
+
+    def open_selected_model_dir(self) -> None:
+        if not self.current_model_id or self.current_model_id == "__legacy_sam__":
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(MODELS_DIR)))
+            return
+        record = self.model_records.get(self.current_model_id)
+        if not record:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.path)))
+
+    def run_nnunet_inference(self) -> None:
+        if not self.current_model_id:
+            show_warning(self, "提示", "请先选择 nnU-Net 模型")
+            return
+        record = self.model_records.get(self.current_model_id)
+        if not record or not record.manifest or record.manifest.type.lower() != "nnunet":
+            show_warning(self, "提示", "当前选择的模型不是 nnU-Net 类型")
+            return
+        folder = choose_folder(self, "选择 PNG 序列文件夹")
+        if not folder:
+            return
+        try:
+            volume = self.volume_loader.load_png_stack(folder)
+        except Exception as exc:
+            show_error(self, "错误", f"加载 PNG 序列失败: {exc}")
+            return
+
+        def task(worker: TaskWorker):
+            return self.nnunet_adapter.predict(
+                self.current_model_id,
+                volume,
+                case_id=volume.case_id or "case",
+                progress_cb=lambda msg: worker.status.emit(msg),
+                log_cb=lambda line: worker.log.emit(line),
+            )
+
+        self._start_task(task, on_success=self._handle_nnunet_result)
+
+    def start_nnunet_training(self) -> None:
+        dataset_id, ok = QInputDialog.getText(self, "启动 nnU-Net 训练", "Dataset ID (数字或名称):", text="")
+        if not ok or not dataset_id:
+            return
+        configuration, ok = QInputDialog.getItem(
+            self, "网络配置", "选择 2D/3D 配置:", ["3d_fullres", "2d"], 0, False
+        )
+        if not ok:
+            return
+        device, _ = QInputDialog.getText(self, "设备 (可选)", "如 cuda:0 / cpu，留空自动选择:", text="")
+        fast_choice, ok = QInputDialog.getItem(self, "快速/开发模式", "是否启用 fast/dev (--npz):", ["否", "是"], 0, False)
+        fast_mode = ok and fast_choice == "是"
+
+        cfg = TrainConfig(
+            dataset_id=dataset_id,
+            configuration=configuration,
+            device=device or None,
+            fast=fast_mode,
+            meta={
+                "name": f"{dataset_id}_{configuration}",
+                "capabilities": ["3d"] if "3d" in configuration else ["2d"],
+                "input_format": "nifti",
+            },
+        )
+
+        def task(worker: TaskWorker):
+            return self.train_runner.run(cfg, log_cb=lambda line: worker.status.emit(line))
+
+        self._start_task(task, on_success=self._on_install_success)
+
+    def _handle_nnunet_result(self, prediction) -> None:
+        if not prediction:
+            return
+        if prediction.mask_volume is not None and self.current_session:
+            mask_vol = prediction.mask_volume
+            slice_idx = mask_vol.shape[0] // 2
+            mask2d = mask_vol[slice_idx]
+            # 维度检查
+            state = self.current_session.state
+            if mask2d.shape != (state.original_image.height, state.original_image.width):
+                show_warning(self, "提示", "nnU-Net 输出尺寸与当前图片不一致，跳过自动覆盖。")
+            else:
+                state.auto_mask = mask2d.astype(bool)
+                state.mask_layers.result = state.auto_mask
+                self.image_viewer.set_state(state)
+        show_info(self, "完成", f"nnU-Net 推理完成，输出文件: {prediction.output_file}")
+        self.status_label.setText("状态: nnU-Net 推理完成")
 
     def _apply_styles(self, sidebar: QWidget, header: QWidget) -> None:
         """统一顶部工具栏与左侧侧边栏的简单美化样式。"""

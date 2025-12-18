@@ -26,10 +26,12 @@ class SamEngine:
         checkpoint: Path = MODEL_CHECKPOINT,
         model_type: str = MODEL_TYPE,
     ) -> None:
+        self.model_type = model_type
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         checkpoint_path = Path(checkpoint)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"SAM checkpoint not found: {checkpoint_path}")
+        self.model_name = checkpoint_path.stem
 
         sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path))
         sam.to(device=self.device)

@@ -1,0 +1,15 @@
+{
+  "models": [
+    {
+      "model_id": "nnunetv2-export-fullres-nov23-zenodo10074441",
+      "name": "nnunetv2-export-fullres-nov23-zenodo10074441",
+      "type": "nnunet",
+      "capabilities": ["3d"],
+      "input_format": "nifti",
+      "url": "https://zenodo.org/records/10074441/files/nnunetv2_export_fullres_nov23.zip?download=1",
+      "sha256": "",
+      "source": "default:sources.json",
+      "labels": []
+    }
+  ]
+}

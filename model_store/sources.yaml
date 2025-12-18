@@ -1,0 +1,12 @@
+# 默认模型来源清单（示例），可根据需要替换为真实可访问的权重地址。
+# UI 会读取此文件并提供“一键安装默认模型”的入口。
+models:
+  - model_id: "nnunetv2-export-fullres-nov23-zenodo10074441"
+    name: "nnunetv2-export-fullres-nov23-zenodo10074441"
+    type: "nnunet"
+    capabilities: ["3d"]
+    input_format: "nifti"
+    url: "https://zenodo.org/records/10074441/files/nnunetv2_export_fullres_nov23.zip?download=1"  # 请替换为真实地址
+    sha256: ""  # 可选，若填写会在安装时校验
+    source: "default:sources.yaml"
+    labels: []

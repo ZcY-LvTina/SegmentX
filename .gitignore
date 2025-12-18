@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.pyc
@@ -15,7 +14,13 @@ venv/
 .vscode/
 .idea/
 .qtcreator/
-EOF
 
-# 模型
-*.pth
+# Models cache and payloads
+models/*.zip
+models/*.pth
+models/*.pt
+models/*.ckpt
+models/*/
+model_store/cache/
+model_store/downloads/
+model_store/import_preferences.json
