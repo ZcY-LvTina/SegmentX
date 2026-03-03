@@ -44,6 +44,8 @@ from ..data.import_classifier import (
     ResourceItem,
 )
 from ..data.volume_loader import VolumeLoader, Volume3D
+from ..volume.cache import SliceCache
+from ..volume.provider import PngSeriesProvider
 from ..core.export import bulk_export, save_masked_result
 from ..core.image_io import image_to_array, load_image
 from ..core.sam_engine import SamEngine
@@ -64,6 +66,7 @@ from .dialogs import (
     show_warning,
 )
 from .image_viewer import AspectRatioContainer, ImageViewer
+from .volume_viewer import VolumeViewer3D
 from .shortcuts import setup_shortcuts
 
 
@@ -105,6 +108,7 @@ class MainWindow(QMainWindow):
         self.resources: List[ResourceItem] = []
         self.volume_resources: List[ResourceItem] = []
         self.sessions: List[Session] = []
+        self.active_view: str = "2d"
         self.current_index: int = -1
         self.current_mode: str = "foreground"
 
@@ -227,9 +231,15 @@ class MainWindow(QMainWindow):
         self.model_combo.currentIndexChanged.connect(self._on_model_selected)
         model_row = QHBoxLayout()
         model_row.setSpacing(6)
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItem("Auto", userData="auto")
+        self.view_mode_combo.addItem("2D", userData="2d")
+        self.view_mode_combo.addItem("3D(切片)", userData="3d")
+        self.view_mode_combo.setFixedWidth(100)
         self.refresh_models_button = QPushButton("刷新模型列表")
         self.refresh_models_button.clicked.connect(self._refresh_model_list)
         model_row.addWidget(self.model_combo, stretch=1)
+        model_row.addWidget(self.view_mode_combo, stretch=0)
         model_row.addWidget(self.refresh_models_button, stretch=0)
         info_layout.addLayout(model_row)
         header_layout.addLayout(info_layout)
@@ -326,14 +336,19 @@ class MainWindow(QMainWindow):
         # Image area
         image_panel = QWidget()
         image_layout = QVBoxLayout(image_panel)
-        ratio_container = AspectRatioContainer(ratio=4 / 3)
-        ratio_container.set_child(self.image_viewer)
-        ratio_container.setMinimumSize(800, 600)
-        ratio_container.setSizePolicy(
+        self.ratio_container = AspectRatioContainer(ratio=4 / 3)
+        self.ratio_container.set_child(self.image_viewer)
+        self.ratio_container.setMinimumSize(800, 600)
+        self.ratio_container.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        image_layout.addWidget(ratio_container)
+        self.volume_viewer = VolumeViewer3D()
+        self.volume_viewer.clicked.connect(self.on_image_clicked)
+        self.volume_viewer.slice_changed.connect(self._on_volume_slice_changed)
+        self.volume_viewer.hide()
+        image_layout.addWidget(self.ratio_container)
+        image_layout.addWidget(self.volume_viewer)
         content_layout.addWidget(image_panel, stretch=1)
         main_layout.addWidget(content_widget, stretch=1)
 
@@ -364,6 +379,8 @@ class MainWindow(QMainWindow):
 
     @property
     def current_session(self) -> Optional[Session]:
+        if self.active_view == "3d" and self.volume_viewer:
+            return self.volume_viewer.current_session()
         if 0 <= self.current_index < len(self.sessions):
             return self.sessions[self.current_index]
         return None
@@ -414,48 +431,67 @@ class MainWindow(QMainWindow):
         self._enable_manual_controls(False)
         self.toggle_hint_button.setEnabled(False)
 
-        for item in result.images2d:
-            if not item.paths:
-                continue
-            path = item.paths[0]
-            img = load_image(path)
-            state = ImageState(
-                path=path,
-                original_image=img,
-                display_image=img.copy(),
-                click_points=[],
-                labels=[],
-            )
-            self.sessions.append(Session(state, max_history=MAX_HISTORY))
+        mode = self.view_mode_combo.currentData()
+        prefer_3d = mode == "3d" or (mode == "auto" and bool(result.series3d))
 
-        if self.sessions:
-            self.current_index = 0
-            self._show_current_image(reset_view=True)
-            if self.engine:
-                self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
-            else:
-                self.status_label.setText("状态: 已加载图像，但未选择SAM模型")
+        if prefer_3d and result.series3d:
+            series = result.series3d[0]
+            try:
+                provider = PngSeriesProvider(series.id, [Path(p) for p in series.paths])
+                cache = SliceCache(provider, kmax=64)
+                self._activate_volume_view(provider, cache)
+                self.status_label.setText(
+                    f"状态: 已加载 3D 序列 {provider.depth} 张，尺寸 {provider.width}x{provider.height}"
+                )
+                self.save_button.setEnabled(True)
+                self.save_all_button.setEnabled(False)
+                self.manual_mode_button.setEnabled(True)
+                self.toggle_hint_button.setEnabled(True)
+            except Exception as exc:
+                show_error(self, "错误", f"加载 3D 序列失败: {exc}")
+                self._activate_2d_view()
         else:
-            self.image_viewer.reset_view()
+            self._activate_2d_view()
+            entries = list(result.images2d)
+            if mode == "2d":
+                for ser in result.series3d:
+                    for p in ser.paths:
+                        entries.append(ResourceItem(id=ser.id, type="image2d", paths=[p], name=p, meta={}))
+            for item in entries:
+                if not item.paths:
+                    continue
+                path = item.paths[0]
+                img = load_image(path)
+                state = ImageState(
+                    path=path,
+                    original_image=img,
+                    display_image=img.copy(),
+                    click_points=[],
+                    labels=[],
+                )
+                self.sessions.append(Session(state, max_history=MAX_HISTORY))
+
+            if self.sessions:
+                self.current_index = 0
+                self._show_current_image(reset_view=True)
+                if self.engine:
+                    self._set_engine_image(self.current_session.state.original_image, self.current_session.state.path)  # type: ignore[union-attr]
+                else:
+                    self.status_label.setText("状态: 已加载图像，但未选择SAM模型")
+            else:
+                self.image_viewer.reset_view()
+            self.save_button.setEnabled(bool(self.sessions))
+            self.save_all_button.setEnabled(bool(self.sessions))
+            self.manual_mode_button.setEnabled(bool(self.sessions))
+            self.toggle_hint_button.setEnabled(bool(self.sessions))
 
         self._update_navigation_buttons()
         self._update_history_buttons()
-        self.save_button.setEnabled(bool(self.sessions))
-        self.save_all_button.setEnabled(bool(self.sessions))
-        self.manual_mode_button.setEnabled(bool(self.sessions))
-        self.toggle_hint_button.setEnabled(bool(self.sessions))
         self._update_image_info()
         hint_state = self.current_session.state.mask_layers.show_hint if self.current_session else False  # type: ignore[union-attr]
         self._sync_hint_button(hint_state)
 
-        image_count = len(self.sessions)
-        volume_count = len(self.volume_resources)
-        if image_count or volume_count:
-            if image_count:
-                self.status_label.setText(f"状态: 已加载 {image_count} 张图片，体数据 {volume_count} 个")
-            else:
-                self.status_label.setText(f"状态: 已加载体数据 {volume_count} 个，当前不支持预览")
-        else:
+        if not self.current_session and not self.sessions and not self.volume_resources:
             self.status_label.setText("状态: 未找到可导入的文件")
 
     def _ask_series_resolution(self, group: PngSeriesGroup) -> tuple[Optional[str], bool]:
@@ -503,7 +539,7 @@ class MainWindow(QMainWindow):
             return
         session.undo_stack.clear()
         session.redo_stack.clear()
-        self.image_viewer.set_state(session.state, reset_view=reset_view)
+        self._active_image_viewer().set_state(session.state, reset_view=reset_view)
         self._update_history_buttons()
         self._sync_hint_button(session.state.mask_layers.show_hint)
         self._sync_manual_controls(session.state)
@@ -559,7 +595,11 @@ class MainWindow(QMainWindow):
         """更新顶部信息栏：模型名称 + 图片进度。"""
         model_name = self._current_model_display() or MODEL_TYPE
         self._set_elided_label(self.model_status_label, f"当前模型：{model_name}")
-        if self.sessions and 0 <= self.current_index < len(self.sessions):
+        if self.active_view == "3d" and self.volume_viewer and self.volume_viewer.total_slices() > 0:
+            self.image_count_label.setText(
+                f"切片：{self.volume_viewer.current_index() + 1}/{self.volume_viewer.total_slices()}"
+            )
+        elif self.sessions and 0 <= self.current_index < len(self.sessions):
             self.image_count_label.setText(f"图片：{self.current_index + 1}/{len(self.sessions)}")
         else:
             self.image_count_label.setText("图片：0/0")
@@ -570,6 +610,46 @@ class MainWindow(QMainWindow):
         elided = label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, width)
         label.setText(elided)
         label.setToolTip(text)
+
+    def _active_image_viewer(self) -> ImageViewer:
+        if self.active_view == "3d" and self.volume_viewer:
+            return self.volume_viewer.viewer
+        return self.image_viewer
+
+    def _zoom_active(self, factor: float) -> None:
+        self._active_image_viewer().zoom(factor)
+
+    def _reset_active_view(self) -> None:
+        self._active_image_viewer().reset_view()
+
+    def _activate_volume_view(self, provider: PngSeriesProvider, cache: SliceCache) -> None:
+        self.active_view = "3d"
+        if self.ratio_container:
+            self.ratio_container.hide()
+        if self.volume_viewer:
+            self.volume_viewer.set_provider(provider, cache, kmax=cache.kmax)
+            self.volume_viewer.show()
+        self._update_navigation_buttons()
+        self._update_history_buttons()
+        self._update_image_info()
+
+    def _activate_2d_view(self) -> None:
+        self.active_view = "2d"
+        if self.volume_viewer:
+            self.volume_viewer.hide()
+        if self.ratio_container:
+            self.ratio_container.show()
+
+    def _on_volume_slice_changed(self, index: int) -> None:
+        session = self.current_session
+        if not session:
+            return
+        if self.engine:
+            self._set_engine_image(session.state.original_image, session.state.path)
+        self._sync_hint_button(session.state.mask_layers.show_hint)
+        self._sync_manual_controls(session.state)
+        self._update_history_buttons()
+        self._update_image_info()
 
     def save_current_result(self) -> None:
         session = self.current_session
@@ -747,7 +827,7 @@ class MainWindow(QMainWindow):
         session.state.labels.append(1 if self.current_mode == "foreground" else 0)
 
         self._run_segmentation(session)
-        self.image_viewer.set_state(session.state)
+        self._active_image_viewer().set_state(session.state)
         self._update_history_buttons()
 
     def _run_segmentation(self, session: Session) -> None:
@@ -828,7 +908,7 @@ class MainWindow(QMainWindow):
         session = self.current_session
         if not session:
             return
-        self.image_viewer.set_state(session.state)
+        self._active_image_viewer().set_state(session.state)
 
     def clear_markers(self) -> None:
         session = self.current_session
@@ -847,7 +927,7 @@ class MainWindow(QMainWindow):
         session.state.mask_layers.hint = None
         session.state.display_image = session.state.original_image.copy()
 
-        self.image_viewer.set_state(session.state)
+        self._active_image_viewer().set_state(session.state)
         self._sync_manual_controls(session.state)
         self.status_label.setText("状态: 已清除所有标记")
         self._update_history_buttons()
@@ -858,7 +938,7 @@ class MainWindow(QMainWindow):
             return
         if session.undo() is None:
             return
-        self.image_viewer.set_state(session.state)
+        self._active_image_viewer().set_state(session.state)
         self.status_label.setText("状态: 已撤销上一步操作")
         self._update_history_buttons()
 
@@ -868,7 +948,7 @@ class MainWindow(QMainWindow):
             return
         if session.redo() is None:
             return
-        self.image_viewer.set_state(session.state)
+        self._active_image_viewer().set_state(session.state)
         self.status_label.setText("状态: 已重做操作")
         self._update_history_buttons()
 
@@ -890,7 +970,7 @@ class MainWindow(QMainWindow):
         self.toggle_hint_button.blockSignals(True)
         self.toggle_hint_button.setChecked(show)
         self.toggle_hint_button.setText("隐藏提示掩膜" if show else "显示提示掩膜")
-        self.toggle_hint_button.setEnabled(bool(self.sessions))
+        self.toggle_hint_button.setEnabled(bool(self.current_session))
         self.toggle_hint_button.blockSignals(False)
 
     def _enable_manual_controls(self, enabled: bool) -> None:
@@ -900,7 +980,7 @@ class MainWindow(QMainWindow):
 
     def _sync_manual_controls(self, state: ImageState) -> None:
         self.manual_mode_button.blockSignals(True)
-        self.manual_mode_button.setEnabled(bool(self.sessions))
+        self.manual_mode_button.setEnabled(bool(self.current_session))
         self.manual_mode_button.setChecked(state.manual_edit_enabled)
         self.manual_mode_button.blockSignals(False)
         self._enable_manual_controls(state.manual_edit_enabled)
